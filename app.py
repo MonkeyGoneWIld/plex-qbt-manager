@@ -21,7 +21,6 @@ from flask import Flask, jsonify, request
 from plexapi.exceptions import PlexApiException
 from plexapi.server import PlexServer
 from qbittorrentapi import Client as QBittorrentClient
-from qbittorrentapi.exceptions import APIConnectionError
 from waitress import serve
 
 
@@ -40,6 +39,9 @@ class Config:
     # either would stall the loop for as long as the other end takes to answer.
     plex_timeout: int = int(os.getenv('PLEX_TIMEOUT', '10'))
     qbt_timeout: int = int(os.getenv('QBITTORRENT_TIMEOUT', '10'))
+    # How often to re-read qBittorrent purely to detect an external change.
+    # Changes we initiate are applied immediately regardless.
+    drift_check_seconds: int = int(os.getenv('DRIFT_CHECK_SECONDS', '30'))
     log_level: str = os.getenv('LOG_LEVEL', 'INFO')
     http_port: int = int(os.getenv('HTTP_PORT', '5252'))
 
@@ -126,6 +128,8 @@ class StateManager:
         # of waiting out its interval.
         self.wake = threading.Event()
         self.plex_failures = 0
+        self.qbt_failures = 0
+        self.last_drift_check = datetime.now()
         self.plex = None
         self.qbt = None
         self._connect()
@@ -286,6 +290,20 @@ class StateManager:
 
     # -- qBittorrent ----------------------------------------------------
 
+    def _qbt_failed(self, action: str, exc: Exception):
+        """Tolerate transient qBittorrent failures.
+
+        Discarding the client on the first timeout meant a busy Web UI got a
+        full re-login on the next cycle, adding round trips to the thing that
+        was already too slow to answer.
+        """
+        self.qbt_failures += 1
+        logger.error(f"qBittorrent {action} failed ({self.qbt_failures}/3): {exc}")
+        if self.qbt_failures >= 3:
+            logger.error("Dropping qBittorrent connection after 3 consecutive failures")
+            self.qbt = None
+            self.qbt_failures = 0
+
     def _read_alt_speeds(self) -> Optional[bool]:
         """Current state from qBittorrent, or None if it can't be reached."""
         if not self.qbt:
@@ -294,13 +312,11 @@ class StateManager:
                 return None
         try:
             # speed_limits_mode: 1 = alternative limits active, 0 = normal
-            return bool(int(self.qbt.transfer.speed_limits_mode))
-        except APIConnectionError as e:
-            logger.error(f"qBittorrent connection error: {e}")
-            self.qbt = None
-            return None
+            value = bool(int(self.qbt.transfer.speed_limits_mode))
+            self.qbt_failures = 0
+            return value
         except Exception as e:
-            logger.error(f"Error reading alternative speeds: {e}")
+            self._qbt_failed("read", e)
             return None
 
     def _reconcile(self, want: bool, tracked: int):
@@ -310,9 +326,19 @@ class StateManager:
         change made by anything else — the Web UI, another script — is noticed
         and corrected instead of leaving us acting on a stale belief.
         """
+        # Read qBittorrent when there's something to change, or periodically to
+        # catch an external change. Reading on every single cycle was enough
+        # extra load to make an already-busy Web UI time out.
+        due = (datetime.now() - self.last_drift_check).total_seconds() >= (
+            self.cfg.drift_check_seconds
+        )
+        if want == self.alt_speeds and not due:
+            return
+
         actual = self._read_alt_speeds()
         if actual is None:
             return
+        self.last_drift_check = datetime.now()
 
         if actual != self.alt_speeds:
             logger.warning(
@@ -343,13 +369,11 @@ class StateManager:
         """Flip the toggle and verify. Only called when it's known to be wrong."""
         try:
             self.qbt.transfer.toggle_speed_limits_mode()
-            return bool(int(self.qbt.transfer.speed_limits_mode)) == enable
-        except APIConnectionError as e:
-            logger.error(f"qBittorrent connection error: {e}")
-            self.qbt = None
-            return False
+            result = bool(int(self.qbt.transfer.speed_limits_mode)) == enable
+            self.qbt_failures = 0
+            return result
         except Exception as e:
-            logger.error(f"Error setting alternative speeds: {e}")
+            self._qbt_failed("toggle", e)
             return False
 
     # -- reporting ------------------------------------------------------

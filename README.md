@@ -11,7 +11,7 @@ A session is tracked from the moment it starts playing until its grace timer exp
 - Plex's session list is the single source of truth. A pause or buffer starts a `PAUSE_BUFFER_DELAY_SECONDS` timer; a stop, or a session vanishing from Plex, starts a `STOP_DELAY_SECONDS` one. Resuming clears it. Speeds only drop once every tracked session's timer has expired, so seeking and buffering don't cause flapping.
 - Polling every `POLLING_INTERVAL` seconds drives all of it, so the service works without Plex Pass (webhooks need it).
 - Plex webhooks (`media.play`, `pause`, `stop`, `buffer`) hit `/webhook` and trigger an immediate re-read rather than being trusted on their own — a Plex webhook payload carries no `sessionKey`, so it can't be matched against the sessions the API reports. They make it react in under a second; they're never the source of truth.
-- qBittorrent is re-read every cycle, not cached. If anything else flips the toggle — the Web UI, another script — it's logged and corrected rather than silently ignored.
+- qBittorrent is re-read rather than cached, so if anything else flips the toggle — the Web UI, another script — it's logged at `WARNING` and corrected. Changes this service makes are applied at once; drift checks run every `DRIFT_CHECK_SECONDS`.
 
 ## Deploy
 
@@ -51,6 +51,7 @@ Update with `docker compose pull && docker compose up -d`. Every push to `main` 
 | `PAUSE_BUFFER_DELAY_SECONDS` | `60` | Grace period after a pause or buffer |
 | `PLEX_TIMEOUT` | `10` | Plex read timeout, seconds |
 | `QBITTORRENT_TIMEOUT` | `10` | qBittorrent read timeout — raise if a busy Web UI logs read timeouts |
+| `DRIFT_CHECK_SECONDS` | `30` | How often to re-read qBittorrent purely to catch an externally-made change. Speed changes this service makes are applied immediately regardless |
 | `LOG_LEVEL` | `INFO` | `DEBUG` logs every session's local/remote decision |
 | `HTTP_PORT` | `5252` | Listen port |
 
