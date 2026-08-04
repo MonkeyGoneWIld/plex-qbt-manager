@@ -70,7 +70,7 @@ Start with `docker compose logs -f`.
 | `Failed to connect to qBittorrent` | Wrong credentials, or Web UI host-header validation is rejecting the container name — disable it or whitelist |
 | Speeds never change | Check `alt_speeds_enabled` in `/status`. If it moves but nothing slows down, the rate limits aren't set in qBittorrent itself |
 | Webhooks never arrive | Requires Plex Pass. Set `LOG_LEVEL=DEBUG` and watch for `Webhook ...` lines |
-| LAN playback throttles downloads | `LOG_LEVEL=DEBUG` and look for `Local session ... ignored` |
+| LAN playback throttles downloads | `LOG_LEVEL=DEBUG` prints `Session <key>: remote/local, state=<state>` for every session each poll — that's Plex's own `local` flag |
 
 Simulate an event without Plex:
 
@@ -80,7 +80,11 @@ curl -X POST http://localhost:5252/webhook -H "Content-Type: application/json" -
 
 ## Logs
 
-Everything goes to stdout (rotated by Docker's json-file driver, 10 MB × 3). A rotating `/app/logs/app.log` (5 MB × 5) is also written inside the container — mount `/app/logs` to keep it on disk, otherwise it's discarded when the container is recreated.
+Everything goes to stdout, rotated by Docker's json-file driver (10 MB × 3) — that's what `docker compose logs` and any stack UI reads.
+
+A rotating `/app/logs/app.log` (5 MB × 5) is written inside the container as well. It's discarded whenever the container is recreated, including on every update; mount `/app/logs` to an absolute host path to keep it.
+
+`LOG_LEVEL=DEBUG` adds the per-session local/remote decision on every poll and the full webhook payloads. `urllib3`, `requests` and `plexapi` are pinned to INFO so DEBUG stays readable — poll traffic would otherwise drown it.
 
 ## License
 

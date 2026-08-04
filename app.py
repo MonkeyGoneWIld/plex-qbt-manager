@@ -56,10 +56,15 @@ def setup_logging():
 
     logging.basicConfig(
         level=getattr(logging, config.log_level.upper(), logging.INFO),
-        format='%(asctime)s - %(levelname)s - %(message)s',
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=handlers,
         force=True,
     )
+
+    # LOG_LEVEL=DEBUG is for diagnosing session detection, not HTTP plumbing.
+    # Left at DEBUG these log every poll's connection and bury the useful lines.
+    for noisy in ('urllib3', 'requests', 'plexapi'):
+        logging.getLogger(noisy).setLevel(logging.INFO)
 
 
 setup_logging()
@@ -221,8 +226,14 @@ class StateManager:
                     continue
                 user = session.usernames[0] if session.usernames else 'unknown'
                 key = f"{session.sessionKey}_{user}"
-                if not self._is_remote(session):
-                    logger.debug(f"Local session {key} ignored")
+                remote = self._is_remote(session)
+                # Logged for every session, not just ignored ones: the usual
+                # question at DEBUG is why a session was judged the way it was.
+                logger.debug(
+                    f"Session {key}: {'remote' if remote else 'local'}, "
+                    f"state={players[0].state}"
+                )
+                if not remote:
                     continue
                 (playing if players[0].state == 'playing' else idle).add(key)
         except PlexApiException as e:
