@@ -1,0 +1,28 @@
+# Secrets — never commit these
+.env
+*.env
+!.env.example
+
+# Runtime
+logs/
+*.log
+
+# Superseded source kept locally for reference
+app.py_old
+*.bak
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

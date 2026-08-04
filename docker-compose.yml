@@ -1,0 +1,47 @@
+services:
+  plex-qbt-manager:
+    image: ghcr.io/monkeygonewild/plex-qbt-manager:latest
+    # To build locally instead of pulling, comment out `image:` above and uncomment:
+    # build: .
+    container_name: plex-qbt-manager
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-5252}:5252"
+    environment:
+      # --- Plex ---
+      PLEX_URL: ${PLEX_URL:-http://plex:32400}
+      PLEX_TOKEN: ${PLEX_TOKEN:?PLEX_TOKEN is required}
+      # --- qBittorrent ---
+      QBITTORRENT_URL: ${QBITTORRENT_URL:-http://qbittorrent:8080}
+      QBITTORRENT_USERNAME: ${QBITTORRENT_USERNAME:?QBITTORRENT_USERNAME is required}
+      QBITTORRENT_PASSWORD: ${QBITTORRENT_PASSWORD:?QBITTORRENT_PASSWORD is required}
+      # --- Behaviour ---
+      POLLING_INTERVAL: ${POLLING_INTERVAL:-5}
+      DEBOUNCE_SECONDS: ${DEBOUNCE_SECONDS:-3}
+      STOP_DELAY_SECONDS: ${STOP_DELAY_SECONDS:-30}
+      PAUSE_BUFFER_DELAY_SECONDS: ${PAUSE_BUFFER_DELAY_SECONDS:-60}
+      # --- Service ---
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      HTTP_PORT: 5252
+    networks:
+      - plex-network
+    healthcheck:
+      test: ["CMD", "python", "/app/healthcheck.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    volumes:
+      # File logging (rotated at 5x5MB by the app). The container runs as uid 1000;
+      # if the directory isn't writable the app silently falls back to stdout only:
+      #   mkdir -p logs && sudo chown 1000:1000 logs
+      - ./logs:/app/logs
+
+networks:
+  plex-network:
+    external: true
