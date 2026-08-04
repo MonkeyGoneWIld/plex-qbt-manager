@@ -36,6 +36,10 @@ class Config:
     debounce_seconds: int = int(os.getenv('DEBOUNCE_SECONDS', '3'))
     stop_delay_seconds: int = int(os.getenv('STOP_DELAY_SECONDS', '30'))
     pause_buffer_delay_seconds: int = int(os.getenv('PAUSE_BUFFER_DELAY_SECONDS', '60'))
+    # Read timeouts. Both are polled on every cycle, so an unbounded wait on
+    # either would stall the loop for as long as the other end takes to answer.
+    plex_timeout: int = int(os.getenv('PLEX_TIMEOUT', '10'))
+    qbt_timeout: int = int(os.getenv('QBITTORRENT_TIMEOUT', '10'))
     log_level: str = os.getenv('LOG_LEVEL', 'INFO')
     http_port: int = int(os.getenv('HTTP_PORT', '5252'))
 
@@ -63,7 +67,7 @@ def setup_logging():
 
     # LOG_LEVEL=DEBUG is for diagnosing session detection, not HTTP plumbing.
     # Left at DEBUG these log every poll's connection and bury the useful lines.
-    for noisy in ('urllib3', 'requests', 'plexapi'):
+    for noisy in ('urllib3', 'requests', 'plexapi', 'qbittorrentapi'):
         logging.getLogger(noisy).setLevel(logging.INFO)
 
 
@@ -118,6 +122,10 @@ class StateManager:
         # Serialises refreshes so a webhook and the poll loop can't both read
         # Plex, then both toggle qBittorrent, and cancel each other out.
         self.refresh_lock = threading.Lock()
+        # Set by webhooks to make the polling loop refresh immediately instead
+        # of waiting out its interval.
+        self.wake = threading.Event()
+        self.plex_failures = 0
         self.plex = None
         self.qbt = None
         self._connect()
@@ -137,7 +145,7 @@ class StateManager:
         return None
 
     def _open_plex(self):
-        plex = PlexServer(self.cfg.plex_url, self.cfg.plex_token)
+        plex = PlexServer(self.cfg.plex_url, self.cfg.plex_token, timeout=self.cfg.plex_timeout)
         logger.info(f"Connected to Plex server: {plex.friendlyName}")
         return plex
 
@@ -146,6 +154,7 @@ class StateManager:
             host=self.cfg.qbt_url,
             username=self.cfg.qbt_username,
             password=self.cfg.qbt_password,
+            REQUESTS_ARGS={'timeout': (3.05, self.cfg.qbt_timeout)},
         )
         qbt.auth_log_in()
         logger.info(f"Connected to qBittorrent: {qbt.app.version}")
@@ -166,11 +175,15 @@ class StateManager:
 
     # -- session events -------------------------------------------------
 
+    def poke(self):
+        """Ask the polling loop to refresh now, without blocking the caller."""
+        self.wake.set()
+
     def refresh(self):
         """Re-read Plex, expire timers, apply the result to qBittorrent.
 
-        The only way session state changes. Webhooks call this instead of
-        mutating sessions themselves, because a Plex webhook payload has no
+        The only way session state changes. Webhooks poke() this rather than
+        supplying state themselves, because a Plex webhook payload has no
         sessionKey and so cannot be matched to the sessions the API reports.
         """
         with self.refresh_lock:
@@ -178,14 +191,19 @@ class StateManager:
             self.tick()
 
     def tick(self):
-        """Drop expired sessions and reconcile. Runs even when Plex is unreachable,
-        so alternative speeds can't get stuck on because a sync failed."""
+        """Drop expired sessions and apply the result. Runs even when Plex is
+        unreachable, so alternative speeds can't get stuck on after a failed sync."""
         with self.lock:
             now = datetime.now()
             for key in [k for k, s in self.sessions.items() if s.expired(now)]:
                 logger.info(f"Session {key} timer expired ({self.sessions[key].delay}s) - dropped")
                 del self.sessions[key]
-            self._reconcile()
+            want, tracked = bool(self.sessions), len(self.sessions)
+
+        # qBittorrent I/O is deliberately outside self.lock: its Web UI can take
+        # seconds to answer, and holding the lock across that would stall /health
+        # and /status too. refresh_lock already prevents overlapping reconciles.
+        self._reconcile(want, tracked)
 
     # -- Plex polling ---------------------------------------------------
 
@@ -222,12 +240,22 @@ class StateManager:
                 if not remote:
                     continue
                 (playing if players[0].state == 'playing' else idle).add(key)
+            self.plex_failures = 0
         except PlexApiException as e:
             logger.error(f"Plex API error during sync: {e}")
             self.plex = None
+            self.plex_failures = 0
             return
         except Exception as e:
-            logger.error(f"Unexpected error during Plex sync: {e}")
+            # Network errors (timeouts, refused connections) aren't
+            # PlexApiException, so without this a Plex outage would leave
+            # plex_connected reporting true indefinitely.
+            self.plex_failures += 1
+            logger.error(f"Plex sync failed ({self.plex_failures}): {e}")
+            if self.plex_failures >= 3:
+                logger.error("Dropping Plex connection after 3 consecutive failures")
+                self.plex = None
+                self.plex_failures = 0
             return
 
         now = datetime.now()
@@ -275,8 +303,8 @@ class StateManager:
             logger.error(f"Error reading alternative speeds: {e}")
             return None
 
-    def _reconcile(self):
-        """Alternative speeds on iff any session is tracked. Caller holds the lock.
+    def _reconcile(self, want: bool, tracked: int):
+        """Drive qBittorrent to `want`. Must NOT be called holding self.lock.
 
         qBittorrent is read every cycle rather than trusted from cache, so a
         change made by anything else — the Web UI, another script — is noticed
@@ -293,7 +321,6 @@ class StateManager:
             )
             self.alt_speeds = actual
 
-        want = bool(self.sessions)
         if want == actual:
             return
 
@@ -307,7 +334,7 @@ class StateManager:
             self.last_change = datetime.now()
             logger.info(
                 f"Alternative speeds {'enabled' if want else 'disabled'} "
-                f"({len(self.sessions)} tracked sessions)"
+                f"({tracked} tracked sessions)"
             )
         else:
             logger.error("Failed to update alternative speeds")
@@ -386,9 +413,12 @@ def webhook():
     # A Plex webhook has no sessionKey, so it can't be tied to a session from
     # the API. Treat it purely as "something changed, look now" and let the
     # Plex session list stay the single source of truth.
+    # Answer immediately and let the polling loop do the work: Plex times its
+    # webhook deliveries out, and refreshing inline would hold the response open
+    # for as long as Plex and qBittorrent take to answer.
     account = (payload.get('Account') or {}).get('title', 'unknown')
-    logger.info(f"Webhook {event} ({account}) - refreshing from Plex")
-    state.refresh()
+    logger.info(f"Webhook {event} ({account}) - waking poll loop")
+    state.poke()
 
     return jsonify({'status': 'ok', 'event': event}), 200
 
@@ -423,10 +453,10 @@ def polling_loop():
             state.refresh()
         except Exception as e:
             logger.error(f"Polling error: {e}")
-        for _ in range(config.polling_interval):
-            if state.shutdown:
-                break
-            time.sleep(1)
+        # Wakes early when a webhook (or shutdown) sets the event, so reaction
+        # stays sub-second without polling any harder than POLLING_INTERVAL.
+        if state.wake.wait(timeout=config.polling_interval):
+            state.wake.clear()
 
 
 def main():
@@ -450,6 +480,7 @@ def main():
     def handle_signal(signum, _frame):
         logger.info(f"Signal {signum} received, shutting down")
         state.shutdown = True
+        state.wake.set()  # break the poll loop out of its wait immediately
         sys.exit(0)
 
     signal.signal(signal.SIGINT, handle_signal)

@@ -49,6 +49,8 @@ Update with `docker compose pull && docker compose up -d`. Every push to `main` 
 | `DEBOUNCE_SECONDS` | `3` | Minimum spacing between speed toggles |
 | `STOP_DELAY_SECONDS` | `30` | Grace period after a stream stops or disappears |
 | `PAUSE_BUFFER_DELAY_SECONDS` | `60` | Grace period after a pause or buffer |
+| `PLEX_TIMEOUT` | `10` | Plex read timeout, seconds |
+| `QBITTORRENT_TIMEOUT` | `10` | qBittorrent read timeout — raise if a busy Web UI logs read timeouts |
 | `LOG_LEVEL` | `INFO` | `DEBUG` logs every session's local/remote decision |
 | `HTTP_PORT` | `5252` | Listen port |
 
@@ -71,6 +73,7 @@ Start with `docker compose logs -f`.
 | `Failed to connect to qBittorrent` | Wrong credentials, or Web UI host-header validation is rejecting the container name — disable it or whitelist |
 | Speeds never change | Check `alt_speeds_enabled` in `/status`. If it moves but nothing slows down, the rate limits aren't set in qBittorrent itself |
 | Webhooks never arrive | Requires Plex Pass. Set `LOG_LEVEL=DEBUG` and watch for `Webhook ...` lines |
+| `urllib3 ... ReadTimeoutError` warnings | qBittorrent's Web UI is answering slowly. Raise `QBITTORRENT_TIMEOUT`, or `POLLING_INTERVAL` to ask less often |
 | LAN playback throttles downloads | `LOG_LEVEL=DEBUG` prints `Session <key>: remote/local, state=<state>` for every session each poll — that's Plex's own `local` flag |
 
 Simulate an event without Plex:
