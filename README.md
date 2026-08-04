@@ -8,9 +8,10 @@ LAN playback is ignored — it pulls from the same box, so throttling downloads 
 
 A session is tracked from the moment it starts playing until its grace timer expires. Alternative speeds are on whenever at least one session is tracked.
 
-- Plex webhooks (`media.play`, `pause`, `stop`, `buffer`) hit `/webhook` and flip the speed within a second.
-- Polling every `POLLING_INTERVAL` seconds is the fallback, so it works without Plex Pass (webhooks need it) and recovers from dropped webhooks.
-- A pause or buffer starts a `PAUSE_BUFFER_DELAY_SECONDS` timer; a stop, or a session vanishing from Plex, starts a `STOP_DELAY_SECONDS` one. Resuming clears it. Speeds only drop once every tracked session's timer has expired, so seeking and buffering don't cause flapping.
+- Plex's session list is the single source of truth. A pause or buffer starts a `PAUSE_BUFFER_DELAY_SECONDS` timer; a stop, or a session vanishing from Plex, starts a `STOP_DELAY_SECONDS` one. Resuming clears it. Speeds only drop once every tracked session's timer has expired, so seeking and buffering don't cause flapping.
+- Polling every `POLLING_INTERVAL` seconds drives all of it, so the service works without Plex Pass (webhooks need it).
+- Plex webhooks (`media.play`, `pause`, `stop`, `buffer`) hit `/webhook` and trigger an immediate re-read rather than being trusted on their own — a Plex webhook payload carries no `sessionKey`, so it can't be matched against the sessions the API reports. They make it react in under a second; they're never the source of truth.
+- qBittorrent is re-read every cycle, not cached. If anything else flips the toggle — the Web UI, another script — it's logged and corrected rather than silently ignored.
 
 ## Deploy
 

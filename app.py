@@ -115,6 +115,9 @@ class StateManager:
         self.last_change = datetime.now()
         self.shutdown = False
         self.lock = threading.RLock()
+        # Serialises refreshes so a webhook and the poll loop can't both read
+        # Plex, then both toggle qBittorrent, and cancel each other out.
+        self.refresh_lock = threading.Lock()
         self.plex = None
         self.qbt = None
         self._connect()
@@ -163,33 +166,16 @@ class StateManager:
 
     # -- session events -------------------------------------------------
 
-    def playing(self, key: str):
-        """A session is playing: start tracking it, or clear its pending timer."""
-        with self.lock:
-            now = datetime.now()
-            session = self.sessions.get(key)
-            if session is None:
-                self.sessions[key] = Session(self.cfg.stop_delay_seconds, last_playing=now)
-                logger.info(f"Session {key} playing (tracked: {len(self.sessions)})")
-            else:
-                if session.since is not None:
-                    logger.info(f"Session {key} resumed - timer cleared")
-                session.clear_timer(now)
-            self._reconcile()
+    def refresh(self):
+        """Re-read Plex, expire timers, apply the result to qBittorrent.
 
-    def not_playing(self, key: str, reason: str):
-        """A session stopped, paused or buffered: start its grace timer."""
-        delay = (
-            self.cfg.stop_delay_seconds if reason == 'stopped'
-            else self.cfg.pause_buffer_delay_seconds
-        )
-        with self.lock:
-            session = self.sessions.get(key)
-            if session is None:
-                session = self.sessions[key] = Session(delay)
-            if session.since is None:
-                session.start_timer(datetime.now(), reason, delay)
-                logger.info(f"Session {key} {reason} - {delay}s timer started")
+        The only way session state changes. Webhooks call this instead of
+        mutating sessions themselves, because a Plex webhook payload has no
+        sessionKey and so cannot be matched to the sessions the API reports.
+        """
+        with self.refresh_lock:
+            self.sync()
+            self.tick()
 
     def tick(self):
         """Drop expired sessions and reconcile. Runs even when Plex is unreachable,
@@ -270,14 +256,45 @@ class StateManager:
                     session.start_timer(now, 'stopped', self.cfg.stop_delay_seconds)
                     logger.info(f"Session {key} gone from Plex - {session.delay}s timer started")
 
-            self._reconcile()
-
     # -- qBittorrent ----------------------------------------------------
 
+    def _read_alt_speeds(self) -> Optional[bool]:
+        """Current state from qBittorrent, or None if it can't be reached."""
+        if not self.qbt:
+            self._reconnect()
+            if not self.qbt:
+                return None
+        try:
+            # speed_limits_mode: 1 = alternative limits active, 0 = normal
+            return bool(int(self.qbt.transfer.speed_limits_mode))
+        except APIConnectionError as e:
+            logger.error(f"qBittorrent connection error: {e}")
+            self.qbt = None
+            return None
+        except Exception as e:
+            logger.error(f"Error reading alternative speeds: {e}")
+            return None
+
     def _reconcile(self):
-        """Alternative speeds on iff any session is tracked. Caller holds the lock."""
+        """Alternative speeds on iff any session is tracked. Caller holds the lock.
+
+        qBittorrent is read every cycle rather than trusted from cache, so a
+        change made by anything else — the Web UI, another script — is noticed
+        and corrected instead of leaving us acting on a stale belief.
+        """
+        actual = self._read_alt_speeds()
+        if actual is None:
+            return
+
+        if actual != self.alt_speeds:
+            logger.warning(
+                f"Alternative speeds changed externally: expected "
+                f"{'on' if self.alt_speeds else 'off'}, found {'on' if actual else 'off'}"
+            )
+            self.alt_speeds = actual
+
         want = bool(self.sessions)
-        if want == self.alt_speeds:
+        if want == actual:
             return
 
         elapsed = (datetime.now() - self.last_change).total_seconds()
@@ -285,7 +302,7 @@ class StateManager:
             logger.debug(f"Debouncing speed change ({elapsed:.1f}s since last)")
             return
 
-        if self._set_alt_speeds(want):
+        if self._toggle_alt_speeds(want):
             self.alt_speeds = want
             self.last_change = datetime.now()
             logger.info(
@@ -295,15 +312,10 @@ class StateManager:
         else:
             logger.error("Failed to update alternative speeds")
 
-    def _set_alt_speeds(self, enable: bool) -> bool:
-        if not self.qbt:
-            self._reconnect()
-            if not self.qbt:
-                return False
+    def _toggle_alt_speeds(self, enable: bool) -> bool:
+        """Flip the toggle and verify. Only called when it's known to be wrong."""
         try:
-            # speed_limits_mode: 1 = alternative limits active, 0 = normal
-            if bool(int(self.qbt.transfer.speed_limits_mode)) != enable:
-                self.qbt.transfer.toggle_speed_limits_mode()
+            self.qbt.transfer.toggle_speed_limits_mode()
             return bool(int(self.qbt.transfer.speed_limits_mode)) == enable
         except APIConnectionError as e:
             logger.error(f"qBittorrent connection error: {e}")
@@ -345,6 +357,11 @@ def _webhook_payload() -> Optional[dict]:
     return None
 
 
+PLAYBACK_EVENTS = frozenset(
+    {'media.play', 'media.resume', 'media.pause', 'media.stop', 'media.buffer'}
+)
+
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     if state is None:
@@ -360,28 +377,18 @@ def webhook():
         return jsonify({'error': 'no valid payload'}), 400
 
     event = payload.get('event')
-    account = payload.get('Account') or {}
-    key = f"{payload.get('sessionKey', 'unknown')}_{account.get('title', 'unknown')}"
-
-    player = payload.get('Player') or {}
-    local = player.get('local', player.get('Local'))
-    if local is not None and bool(local):
-        logger.info(f"Ignoring local session {key} ({event})")
-        return jsonify({'status': 'ignored', 'reason': 'local_session'}), 200
-
-    logger.info(f"Webhook {event} for {key}")
     logger.debug(f"Payload: {json.dumps(payload)}")
 
-    if event in ('media.play', 'media.resume'):
-        state.playing(key)
-    elif event == 'media.stop':
-        state.not_playing(key, 'stopped')
-    elif event == 'media.pause':
-        state.not_playing(key, 'paused')
-    elif event == 'media.buffer':
-        state.not_playing(key, 'buffered')
-    else:
+    if event not in PLAYBACK_EVENTS:
         logger.debug(f"Ignoring event {event}")
+        return jsonify({'status': 'ignored', 'event': event}), 200
+
+    # A Plex webhook has no sessionKey, so it can't be tied to a session from
+    # the API. Treat it purely as "something changed, look now" and let the
+    # Plex session list stay the single source of truth.
+    account = (payload.get('Account') or {}).get('title', 'unknown')
+    logger.info(f"Webhook {event} ({account}) - refreshing from Plex")
+    state.refresh()
 
     return jsonify({'status': 'ok', 'event': event}), 200
 
@@ -413,8 +420,7 @@ def polling_loop():
     )
     while not state.shutdown:
         try:
-            state.sync()
-            state.tick()
+            state.refresh()
         except Exception as e:
             logger.error(f"Polling error: {e}")
         for _ in range(config.polling_interval):
