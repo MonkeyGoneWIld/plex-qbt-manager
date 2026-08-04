@@ -11,14 +11,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Copy requirements first for better layer caching
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Application code
-COPY app.py healthcheck.py ./
+COPY app.py .
 
-# Non-root user; logs dir is owned by it so the optional bind mount can be written
+# Non-root; /app/logs is owned by it so an optional bind mount is writable
 RUN useradd --create-home --shell /bin/bash app \
     && mkdir -p /app/logs \
     && chown -R app:app /app
@@ -26,8 +24,8 @@ USER app
 
 EXPOSE 5252
 
-# Pure-Python healthcheck — no curl needed in the image
+# /health answers 503 when degraded, which raises HTTPError and exits non-zero
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
-  CMD ["python", "/app/healthcheck.py"]
+  CMD python -c "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'+os.environ['HTTP_PORT']+'/health',timeout=5)"
 
 CMD ["python", "app.py"]

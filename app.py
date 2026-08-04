@@ -1,24 +1,30 @@
-import os
-import sys
-import json
-import time
-import signal
-import logging
-import threading
-from logging.handlers import RotatingFileHandler
-from datetime import datetime
-from typing import Optional, Dict, Any
-from dataclasses import dataclass
+"""Toggle qBittorrent's alternative speed limits based on remote Plex playback.
 
-from flask import Flask, request, jsonify
-from plexapi.server import PlexServer
+A session is tracked from the moment it starts playing until its grace timer
+expires. Alternative speeds are on whenever at least one session is tracked.
+Plex webhooks are the fast path; polling is the fallback and the reconciler.
+"""
+
+import json
+import logging
+import os
+import signal
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from logging.handlers import RotatingFileHandler
+from typing import Any, Dict, Optional
+
+from flask import Flask, jsonify, request
 from plexapi.exceptions import PlexApiException
+from plexapi.server import PlexServer
 from qbittorrentapi import Client as QBittorrentClient
 from qbittorrentapi.exceptions import APIConnectionError
 from waitress import serve
 
 
-# Configuration
 @dataclass
 class Config:
     plex_url: str = os.getenv('PLEX_URL', 'http://plex:32400')
@@ -28,9 +34,7 @@ class Config:
     qbt_password: str = os.getenv('QBITTORRENT_PASSWORD', '')
     polling_interval: int = int(os.getenv('POLLING_INTERVAL', '5'))
     debounce_seconds: int = int(os.getenv('DEBOUNCE_SECONDS', '3'))
-    # Delay after stream ends before disabling alt speeds (default: 30s)
     stop_delay_seconds: int = int(os.getenv('STOP_DELAY_SECONDS', '30'))
-    # Delay after pause/buffer before disabling alt speeds (default: 60s)
     pause_buffer_delay_seconds: int = int(os.getenv('PAUSE_BUFFER_DELAY_SECONDS', '60'))
     log_level: str = os.getenv('LOG_LEVEL', 'INFO')
     http_port: int = int(os.getenv('HTTP_PORT', '5252'))
@@ -41,654 +45,403 @@ START_TIME = datetime.now()
 
 
 def setup_logging():
-    """Configure logging to stdout, plus a rotating /app/logs/app.log when writable."""
-    log_handlers = [logging.StreamHandler(sys.stdout)]
-
+    handlers = [logging.StreamHandler(sys.stdout)]
     try:
         if os.path.isdir('/app/logs') and os.access('/app/logs', os.W_OK):
-            # Capped at 5 x 5MB; an unrotated handler here grows without bound.
-            log_handlers.append(
-                RotatingFileHandler(
-                    '/app/logs/app.log', maxBytes=5 * 1024 * 1024, backupCount=5
-                )
+            handlers.append(
+                RotatingFileHandler('/app/logs/app.log', maxBytes=5 << 20, backupCount=5)
             )
-    except (PermissionError, OSError) as e:
+    except OSError as e:
         print(f"Warning: cannot write to /app/logs ({e}), logging to console only")
 
     logging.basicConfig(
         level=getattr(logging, config.log_level.upper(), logging.INFO),
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=log_handlers,
-        force=True  # Override any existing configuration
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=handlers,
+        force=True,
     )
 
 
 setup_logging()
-logger = logging.getLogger(__name__)
-
+logger = logging.getLogger('plex-qbt')
 
 app = Flask(__name__)
-state_manager = None  # Created in main()
+state: Optional["StateManager"] = None  # created in main()
 
 
-class SessionState:
-    """Track state for a single session."""
-    def __init__(self, delay_seconds: int = 30):
-        self.is_active = True  # Currently counted towards alt-speed activation
-        self.not_playing_since: Optional[datetime] = None  # When we first saw it not playing
-        self.delay_seconds: int = delay_seconds  # How long to wait before removing
-        self.reason: Optional[str] = None  # Why the timer is running
-        self.last_seen_playing: Optional[datetime] = None  # Last time we saw it playing
+@dataclass
+class Session:
+    """A tracked remote Plex session. `since` is set once it stops playing."""
+
+    delay: int
+    since: Optional[datetime] = None
+    reason: Optional[str] = None
+    last_playing: Optional[datetime] = None
+
+    def remaining(self, now: datetime) -> Optional[float]:
+        if self.since is None:
+            return None
+        return max(0.0, self.delay - (now - self.since).total_seconds())
+
+    def expired(self, now: datetime) -> bool:
+        return self.since is not None and (now - self.since).total_seconds() >= self.delay
+
+    def start_timer(self, now: datetime, reason: str, delay: int):
+        self.since, self.reason, self.delay = now, reason, delay
+
+    def clear_timer(self, now: datetime):
+        self.since = self.reason = None
+        self.last_playing = now
+
+    def snapshot(self, now: datetime) -> Dict[str, Any]:
+        remaining = self.remaining(now)
+        return {
+            'last_playing': self.last_playing.isoformat() if self.last_playing else None,
+            'reason': self.reason,
+            'seconds_remaining': round(remaining, 1) if remaining is not None else None,
+        }
 
 
 class StateManager:
-    def __init__(self, config: Config):
-        self.config = config
-        # session_key -> SessionState
-        self.sessions: Dict[str, SessionState] = {}
-        self.alt_speeds_enabled = False
-        self.last_state_change = datetime.now()
-        self.shutdown_requested = False
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.sessions: Dict[str, Session] = {}
+        self.alt_speeds = False
+        self.last_change = datetime.now()
+        self.shutdown = False
         self.lock = threading.RLock()
-
-        # Initialize clients
         self.plex = None
         self.qbt = None
-        self._init_clients()
+        self._connect()
 
-    def _init_clients(self):
-        """Initialize Plex and qBittorrent clients with retry logic."""
-        max_retries = 3
+    # -- connections ----------------------------------------------------
 
-        # Initialize Plex client
-        for attempt in range(max_retries):
+    @staticmethod
+    def _retry(name: str, connect, attempts: int = 3):
+        for attempt in range(attempts):
             try:
-                self.plex = PlexServer(self.config.plex_url, self.config.plex_token)
-                logger.info(f"Connected to Plex server: {self.plex.friendlyName}")
-                break
+                return connect()
             except Exception as e:
-                logger.warning(f"Plex connection attempt {attempt + 1} failed: {e}")
-                if attempt < max_retries - 1:
+                logger.warning(f"{name} connection attempt {attempt + 1} failed: {e}")
+                if attempt < attempts - 1:
                     time.sleep(2 ** attempt)
-                else:
-                    logger.error("Failed to connect to Plex server")
+        logger.error(f"Failed to connect to {name}")
+        return None
 
-        # Initialize qBittorrent client
-        for attempt in range(max_retries):
-            try:
-                self.qbt = QBittorrentClient(
-                    host=self.config.qbt_url,
-                    username=self.config.qbt_username,
-                    password=self.config.qbt_password
-                )
-                self.qbt.auth_log_in()
-                logger.info(f"Connected to qBittorrent: {self.qbt.app.version}")
+    def _open_plex(self):
+        plex = PlexServer(self.cfg.plex_url, self.cfg.plex_token)
+        logger.info(f"Connected to Plex server: {plex.friendlyName}")
+        return plex
 
-                # Get initial alternative speeds state
-                self.alt_speeds_enabled = bool(int(self.qbt.transfer.speed_limits_mode))
-                logger.info(
-                    f"Initial alternative speeds state: "
-                    f"{'enabled' if self.alt_speeds_enabled else 'disabled'}"
-                )
-                break
-            except Exception as e:
-                logger.warning(f"qBittorrent connection attempt {attempt + 1} failed: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)
-                else:
-                    self.qbt = None
-                    logger.error("Failed to connect to qBittorrent")
+    def _open_qbt(self):
+        qbt = QBittorrentClient(
+            host=self.cfg.qbt_url,
+            username=self.cfg.qbt_username,
+            password=self.cfg.qbt_password,
+        )
+        qbt.auth_log_in()
+        logger.info(f"Connected to qBittorrent: {qbt.app.version}")
+        return qbt
 
-    def reconnect_clients(self):
-        """Attempt to reconnect clients if they're disconnected."""
-        try:
-            if self.plex is None:
-                self.plex = PlexServer(self.config.plex_url, self.config.plex_token)
-                logger.info("Reconnected to Plex server")
-        except Exception as e:
-            logger.error(f"Failed to reconnect to Plex: {e}")
+    def _connect(self):
+        self.plex = self._retry("Plex", self._open_plex)
+        self.qbt = self._retry("qBittorrent", self._open_qbt)
+        if self.qbt:
+            self.alt_speeds = bool(int(self.qbt.transfer.speed_limits_mode))
+            logger.info(f"Initial alternative speeds: {'on' if self.alt_speeds else 'off'}")
 
-        try:
-            if self.qbt is None or not self.qbt.is_logged_in:
-                self.qbt = QBittorrentClient(
-                    host=self.config.qbt_url,
-                    username=self.config.qbt_username,
-                    password=self.config.qbt_password
-                )
-                self.qbt.auth_log_in()
-                logger.info("Reconnected to qBittorrent")
-        except Exception as e:
-            self.qbt = None
-            logger.error(f"Failed to reconnect to qBittorrent: {e}")
+    def _reconnect(self):
+        if self.plex is None:
+            self.plex = self._retry("Plex", self._open_plex, attempts=1)
+        if self.qbt is None or not getattr(self.qbt, 'is_logged_in', False):
+            self.qbt = self._retry("qBittorrent", self._open_qbt, attempts=1)
 
-    def add_remote_session(self, session_key: str):
-        """Add or reactivate a remote session (playing)."""
+    # -- session events -------------------------------------------------
+
+    def playing(self, key: str):
+        """A session is playing: start tracking it, or clear its pending timer."""
         with self.lock:
-            if session_key in self.sessions:
-                state = self.sessions[session_key]
-                was_not_playing = state.not_playing_since is not None
-                state.is_active = True
-                state.not_playing_since = None
-                state.reason = None
-                state.last_seen_playing = datetime.now()
-                if was_not_playing:
-                    logger.info(f"Session {session_key} resumed playing - timer cleared")
-                else:
-                    logger.info(
-                        f"Session {session_key} playing (active sessions: {self._count_active()})"
-                    )
+            now = datetime.now()
+            session = self.sessions.get(key)
+            if session is None:
+                self.sessions[key] = Session(self.cfg.stop_delay_seconds, last_playing=now)
+                logger.info(f"Session {key} playing (tracked: {len(self.sessions)})")
             else:
-                state = SessionState(self.config.stop_delay_seconds)
-                state.last_seen_playing = datetime.now()
-                self.sessions[session_key] = state
-                logger.info(
-                    f"New session {session_key} playing (active sessions: {self._count_active()})"
-                )
+                if session.since is not None:
+                    logger.info(f"Session {key} resumed - timer cleared")
+                session.clear_timer(now)
+            self._reconcile()
 
-            self._update_speeds()
-
-    def mark_remote_not_playing(self, session_key: str, reason: str = "paused/buffered"):
-        """Mark a session as not playing with appropriate delay."""
+    def not_playing(self, key: str, reason: str):
+        """A session stopped, paused or buffered: start its grace timer."""
+        delay = (
+            self.cfg.stop_delay_seconds if reason == 'stopped'
+            else self.cfg.pause_buffer_delay_seconds
+        )
         with self.lock:
-            if session_key not in self.sessions:
-                # Create if not exists (shouldn't happen but handle gracefully)
-                self.sessions[session_key] = SessionState(self.config.stop_delay_seconds)
-
-            state = self.sessions[session_key]
-
-            # Only start timer if not already started
-            if state.not_playing_since is None:
-                state.not_playing_since = datetime.now()
-                state.reason = reason
-                # Use stop delay for stop events, pause/buffer delay otherwise
-                if reason == "stopped":
-                    state.delay_seconds = self.config.stop_delay_seconds
-                else:
-                    state.delay_seconds = self.config.pause_buffer_delay_seconds
-                logger.info(f"Session {session_key} {reason} - started {state.delay_seconds}s timer")
-
-    def _count_active(self) -> int:
-        """Count sessions that are currently active (not in delayed removal)."""
-        return sum(1 for s in self.sessions.values() if s.is_active)
-
-    def _cleanup_expired_sessions(self) -> bool:
-        """Remove sessions whose delay has expired. Returns True if any were removed."""
-        now = datetime.now()
-        removed = []
-
-        for session_key, state in list(self.sessions.items()):
-            if state.not_playing_since is not None:
-                elapsed = (now - state.not_playing_since).total_seconds()
-                if elapsed >= state.delay_seconds:
-                    removed.append(session_key)
-                    logger.info(
-                        f"Session {session_key} delay expired ({state.delay_seconds}s) - removed"
-                    )
-
-        for session_key in removed:
-            self.sessions.pop(session_key, None)
-
-        return len(removed) > 0
+            session = self.sessions.get(key)
+            if session is None:
+                session = self.sessions[key] = Session(delay)
+            if session.since is None:
+                session.start_timer(datetime.now(), reason, delay)
+                logger.info(f"Session {key} {reason} - {delay}s timer started")
 
     def tick(self):
-        """Expire timers and reconcile speeds.
-
-        Runs on every poll even when Plex is unreachable, so alternative speeds
-        are never left stuck on because the Plex sync failed.
-        """
+        """Drop expired sessions and reconcile. Runs even when Plex is unreachable,
+        so alternative speeds can't get stuck on because a sync failed."""
         with self.lock:
-            self._cleanup_expired_sessions()
-            self._update_speeds()
+            now = datetime.now()
+            for key in [k for k, s in self.sessions.items() if s.expired(now)]:
+                logger.info(f"Session {key} timer expired ({self.sessions[key].delay}s) - dropped")
+                del self.sessions[key]
+            self._reconcile()
 
-    def is_session_remote(self, session) -> bool:
-        """Determine if a Plex session is remote based on the 'local' attribute."""
-        try:
-            # Check if the session has the 'local' attribute
-            if hasattr(session, 'local'):
-                is_local = session.local
-                # Remote sessions have local=False or local=0
-                is_remote = not bool(is_local)
-                logger.debug(
-                    f"Session local attribute: {is_local}, "
-                    f"treating as {'remote' if is_remote else 'local'}"
-                )
-                return is_remote
+    # -- Plex polling ---------------------------------------------------
 
-            # Fallback: check player's local attribute if session doesn't have it
-            if hasattr(session, 'players') and session.players:
-                player = session.players[0]
-                if hasattr(player, 'local'):
-                    is_local = player.local
-                    is_remote = not bool(is_local)
-                    logger.debug(
-                        f"Player local attribute: {is_local}, "
-                        f"treating as {'remote' if is_remote else 'local'}"
-                    )
-                    return is_remote
+    @staticmethod
+    def _is_remote(session) -> bool:
+        """Plex marks LAN playback local=1. Default to remote so throttling still happens."""
+        for obj in (session, *(getattr(session, 'players', None) or [])):
+            if hasattr(obj, 'local'):
+                return not bool(obj.local)
+        logger.warning("No 'local' attribute on session, assuming remote")
+        return True
 
-            # If no local attribute is found, log warning and default to remote
-            # This ensures the speed limiting still works if the attribute is missing
-            logger.warning("No 'local' attribute found for session, defaulting to remote")
-            return True
-
-        except Exception as e:
-            logger.error(f"Error checking if session is remote: {e}")
-            # Default to remote on error to be safe
-            return True
-
-    def sync_plex_sessions(self):
-        """Synchronize active remote sessions with Plex server state."""
+    def sync(self):
+        """Reconcile tracked sessions against what Plex currently reports."""
         if not self.plex:
-            self.reconnect_clients()
+            self._reconnect()
             return
 
         try:
-            # Get current Plex sessions
-            sessions = self.plex.sessions()
-            current_remote_playing = set()
-            current_remote_not_playing = set()
-            total_sessions = 0
-            local_sessions = 0
-            remote_playing = 0
-            remote_paused = 0
-            remote_buffering = 0
-
-            for session in sessions:
-                total_sessions += 1
-
-                if hasattr(session, 'players') and session.players:
-                    player = session.players[0]
-                    username = session.usernames[0] if session.usernames else 'unknown'
-                    session_key = f"{session.sessionKey}_{username}"
-
-                    # Check if this is a remote session
-                    if self.is_session_remote(session):
-                        if player.state == 'playing':
-                            current_remote_playing.add(session_key)
-                            remote_playing += 1
-                            logger.debug(f"Remote playing session: {session_key}")
-                        else:
-                            # Any non-playing state (paused, buffering, etc.)
-                            current_remote_not_playing.add(session_key)
-                            if player.state == 'paused':
-                                remote_paused += 1
-                            elif player.state == 'buffering':
-                                remote_buffering += 1
-                            logger.debug(
-                                f"Remote not-playing session ({player.state}): {session_key}"
-                            )
-                    else:
-                        local_sessions += 1
-                        logger.debug(f"Local session: {session_key} (ignored)")
-
-            # Update our tracked remote sessions
-            with self.lock:
-                # Mark playing sessions as active
-                for session_key in current_remote_playing:
-                    if session_key in self.sessions:
-                        state = self.sessions[session_key]
-                        # Was not playing, now playing again - clear timer
-                        if state.not_playing_since is not None:
-                            state.not_playing_since = None
-                            state.reason = None
-                            state.is_active = True
-                            logger.info(
-                                f"Session {session_key} back to playing from polling - timer cleared"
-                            )
-                        state.last_seen_playing = datetime.now()
-                    else:
-                        # New session seen via polling
-                        state = SessionState(self.config.stop_delay_seconds)
-                        state.last_seen_playing = datetime.now()
-                        self.sessions[session_key] = state
-                        logger.info(f"New session {session_key} seen via polling")
-
-                # Mark not-playing sessions with timer
-                for session_key in current_remote_not_playing:
-                    if session_key in self.sessions:
-                        state = self.sessions[session_key]
-                        if state.not_playing_since is None:
-                            state.not_playing_since = datetime.now()
-                            state.delay_seconds = self.config.pause_buffer_delay_seconds
-                            state.reason = 'paused/buffered'
-                            logger.info(
-                                f"Session {session_key} not-playing from polling - "
-                                f"started {state.delay_seconds}s timer"
-                            )
-
-                # Sessions that disappeared from Plex entirely - treat as stopped
-                all_seen = current_remote_playing | current_remote_not_playing
-                for session_key, state in self.sessions.items():
-                    if session_key not in all_seen and state.not_playing_since is None:
-                        state.not_playing_since = datetime.now()
-                        state.delay_seconds = self.config.stop_delay_seconds
-                        state.reason = 'stopped'
-                        logger.info(
-                            f"Session {session_key} disappeared from Plex - "
-                            f"started {state.delay_seconds}s stop timer"
-                        )
-
-                # Clean up expired sessions
-                expired_cleaned = self._cleanup_expired_sessions()
-
-                if expired_cleaned or current_remote_playing or current_remote_not_playing:
-                    timer_info = []
-                    now = datetime.now()
-                    for sk, st in self.sessions.items():
-                        if st.not_playing_since is not None:
-                            elapsed = (now - st.not_playing_since).total_seconds()
-                            remaining = max(0, st.delay_seconds - elapsed)
-                            timer_info.append(f"{sk}({remaining:.0f}s)")
-
-                    logger.debug(
-                        f"Synced Plex sessions: {total_sessions} total, {local_sessions} local, "
-                        f"{remote_playing} playing, {remote_paused} paused, "
-                        f"{remote_buffering} buffering | active: {self._count_active()}, "
-                        f"timers: {len(timer_info)} [{', '.join(timer_info)}]"
-                    )
-
-                # Always reconcile: a session first seen via polling must be able to
-                # turn alternative speeds on without waiting for a webhook.
-                self._update_speeds()
-
+            playing, idle = set(), set()
+            for session in self.plex.sessions():
+                players = getattr(session, 'players', None)
+                if not players:
+                    continue
+                user = session.usernames[0] if session.usernames else 'unknown'
+                key = f"{session.sessionKey}_{user}"
+                if not self._is_remote(session):
+                    logger.debug(f"Local session {key} ignored")
+                    continue
+                (playing if players[0].state == 'playing' else idle).add(key)
         except PlexApiException as e:
             logger.error(f"Plex API error during sync: {e}")
             self.plex = None
+            return
         except Exception as e:
             logger.error(f"Unexpected error during Plex sync: {e}")
-
-    def _update_speeds(self):
-        """Update qBittorrent alternative speeds based on active remote sessions.
-
-        Caller must hold self.lock.
-        """
-        active_count = self._count_active()
-        should_enable = active_count > 0
-
-        if should_enable == self.alt_speeds_enabled:
             return
 
-        # Reduce debounce time or skip it for immediate webhook responses
-        time_since_change = datetime.now() - self.last_state_change
-        min_debounce_time = max(1, self.config.debounce_seconds // 2)
+        now = datetime.now()
+        with self.lock:
+            for key in playing:
+                session = self.sessions.get(key)
+                if session is None:
+                    self.sessions[key] = Session(self.cfg.stop_delay_seconds, last_playing=now)
+                    logger.info(f"Session {key} seen playing via polling")
+                else:
+                    if session.since is not None:
+                        logger.info(f"Session {key} back to playing - timer cleared")
+                    session.clear_timer(now)
 
-        if time_since_change.total_seconds() < min_debounce_time:
-            logger.debug(
-                f"Debouncing speed change (last change {time_since_change.total_seconds():.1f}s ago)"
+            # Only sessions we already track get a pause timer; an idle session we
+            # never saw playing isn't ours to throttle for.
+            for key in idle:
+                session = self.sessions.get(key)
+                if session is not None and session.since is None:
+                    session.start_timer(now, 'paused/buffered', self.cfg.pause_buffer_delay_seconds)
+                    logger.info(f"Session {key} not playing - {session.delay}s timer started")
+
+            # Gone from Plex entirely: treat as stopped.
+            for key, session in self.sessions.items():
+                if key not in playing and key not in idle and session.since is None:
+                    session.start_timer(now, 'stopped', self.cfg.stop_delay_seconds)
+                    logger.info(f"Session {key} gone from Plex - {session.delay}s timer started")
+
+            self._reconcile()
+
+    # -- qBittorrent ----------------------------------------------------
+
+    def _reconcile(self):
+        """Alternative speeds on iff any session is tracked. Caller holds the lock."""
+        want = bool(self.sessions)
+        if want == self.alt_speeds:
+            return
+
+        elapsed = (datetime.now() - self.last_change).total_seconds()
+        if elapsed < max(1, self.cfg.debounce_seconds // 2):
+            logger.debug(f"Debouncing speed change ({elapsed:.1f}s since last)")
+            return
+
+        if self._set_alt_speeds(want):
+            self.alt_speeds = want
+            self.last_change = datetime.now()
+            logger.info(
+                f"Alternative speeds {'enabled' if want else 'disabled'} "
+                f"({len(self.sessions)} tracked sessions)"
             )
-            return
-
-        if self._set_alternative_speeds(should_enable):
-            self.alt_speeds_enabled = should_enable
-            self.last_state_change = datetime.now()
-            action = "enabled" if should_enable else "disabled"
-            if should_enable:
-                logger.info(f"Alternative speeds {action} ({active_count} active sessions)")
-            else:
-                logger.info(f"Alternative speeds {action} (no active sessions after delay expired)")
         else:
             logger.error("Failed to update alternative speeds")
 
-    def _set_alternative_speeds(self, enable: bool) -> bool:
-        """Enable or disable qBittorrent alternative-speed limits."""
+    def _set_alt_speeds(self, enable: bool) -> bool:
         if not self.qbt:
-            self.reconnect_clients()
+            self._reconnect()
             if not self.qbt:
                 return False
-
         try:
-            # Toggle only if the current state is the opposite of what we want
-            current = int(self.qbt.transfer.speed_limits_mode)  # 1=alt on, 0=alt off
-            if bool(current) != enable:
+            # speed_limits_mode: 1 = alternative limits active, 0 = normal
+            if bool(int(self.qbt.transfer.speed_limits_mode)) != enable:
                 self.qbt.transfer.toggle_speed_limits_mode()
-
-            # Verify the change
-            new_state = int(self.qbt.transfer.speed_limits_mode)
-            return bool(new_state) == enable
-
+            return bool(int(self.qbt.transfer.speed_limits_mode)) == enable
         except APIConnectionError as e:
-            logger.error(f"qBittorrent API connection error: {e}")
+            logger.error(f"qBittorrent connection error: {e}")
             self.qbt = None
             return False
         except Exception as e:
             logger.error(f"Error setting alternative speeds: {e}")
             return False
 
-    def get_status(self) -> Dict[str, Any]:
-        """Get current status for health checks and debugging."""
+    # -- reporting ------------------------------------------------------
+
+    def status(self) -> Dict[str, Any]:
         with self.lock:
             now = datetime.now()
-            sessions_info = {}
-            for session_key, state in self.sessions.items():
-                info = {
-                    'is_active': state.is_active,
-                    'last_seen_playing': (
-                        state.last_seen_playing.isoformat() if state.last_seen_playing else None
-                    ),
-                }
-                if state.not_playing_since is not None:
-                    elapsed = (now - state.not_playing_since).total_seconds()
-                    remaining = max(0, state.delay_seconds - elapsed)
-                    info['not_playing_elapsed'] = round(elapsed, 1)
-                    info['not_playing_remaining'] = round(remaining, 1)
-                    info['delay_seconds'] = state.delay_seconds
-                    info['reason'] = state.reason or 'paused/buffered'
-                sessions_info[session_key] = info
-
             return {
-                'active_sessions_count': self._count_active(),
-                'total_tracked_sessions': len(self.sessions),
-                'sessions_detail': sessions_info,
-                'stop_delay_seconds': self.config.stop_delay_seconds,
-                'pause_buffer_delay_seconds': self.config.pause_buffer_delay_seconds,
-                'alt_speeds_enabled': self.alt_speeds_enabled,
+                'tracked_sessions': len(self.sessions),
+                'sessions': {k: s.snapshot(now) for k, s in self.sessions.items()},
+                'alt_speeds_enabled': self.alt_speeds,
                 'plex_connected': self.plex is not None,
-                'qbt_connected': self.qbt is not None and bool(
-                    getattr(self.qbt, 'is_logged_in', True)
-                ),
-                'last_state_change': self.last_state_change.isoformat(),
+                'qbt_connected': self.qbt is not None
+                and bool(getattr(self.qbt, 'is_logged_in', True)),
+                'stop_delay_seconds': self.cfg.stop_delay_seconds,
+                'pause_buffer_delay_seconds': self.cfg.pause_buffer_delay_seconds,
                 'uptime_seconds': round((now - START_TIME).total_seconds(), 1),
             }
 
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint for Docker and monitoring."""
-    if not state_manager:
-        return jsonify({'status': 'initializing', 'timestamp': datetime.now().isoformat()}), 503
+# -- HTTP ---------------------------------------------------------------
 
-    status = state_manager.get_status()
-    is_healthy = status['plex_connected'] and status['qbt_connected']
 
-    return jsonify({
-        'status': 'healthy' if is_healthy else 'unhealthy',
-        'timestamp': datetime.now().isoformat(),
-        **status
-    }), 200 if is_healthy else 503
+def _webhook_payload() -> Optional[dict]:
+    """Plex posts multipart form-data with a JSON 'payload' field; allow raw JSON too."""
+    if request.is_json:
+        return request.get_json(silent=True)
+    if request.form.get('payload'):
+        return json.loads(request.form['payload'])
+    if request.data:
+        return json.loads(request.data.decode())
+    return None
 
 
 @app.route('/webhook', methods=['POST'])
-def plex_webhook():
-    """Handle Plex webhook events for remote sessions only."""
-    if not state_manager:
-        return jsonify({'error': 'Service initializing'}), 503
+def webhook():
+    if state is None:
+        return jsonify({'error': 'initializing'}), 503
 
     try:
-        # Handle both JSON and form-encoded payloads (Plex can send either)
+        payload = _webhook_payload()
+    except (json.JSONDecodeError, UnicodeDecodeError):
         payload = None
 
-        if request.is_json:
-            payload = request.get_json(silent=True)
-        elif request.form:
-            # Plex sends multipart/form-data with a 'payload' field containing JSON
-            payload_str = request.form.get('payload')
-            if payload_str:
-                payload = json.loads(payload_str)
-        elif request.data:
-            # Try to parse raw data as JSON
-            try:
-                payload = json.loads(request.data.decode('utf-8'))
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                pass
+    if not payload:
+        logger.warning(f"Unparseable webhook (Content-Type: {request.content_type})")
+        return jsonify({'error': 'no valid payload'}), 400
 
-        if not payload:
-            logger.warning(
-                f"No valid payload found. Content-Type: {request.content_type}, "
-                f"Data: {request.data[:200]}"
-            )
-            return jsonify({'error': 'No valid payload found'}), 400
+    event = payload.get('event')
+    account = payload.get('Account') or {}
+    key = f"{payload.get('sessionKey', 'unknown')}_{account.get('title', 'unknown')}"
 
-        # Extract event information
-        event = payload.get('event')
-        account = payload.get('Account', {})
-        player = payload.get('Player', {})
+    player = payload.get('Player') or {}
+    local = player.get('local', player.get('Local'))
+    if local is not None and bool(local):
+        logger.info(f"Ignoring local session {key} ({event})")
+        return jsonify({'status': 'ignored', 'reason': 'local_session'}), 200
 
-        session_key = f"{payload.get('sessionKey', 'unknown')}_{account.get('title', 'unknown')}"
+    logger.info(f"Webhook {event} for {key}")
+    logger.debug(f"Payload: {json.dumps(payload)}")
 
-        logger.info(f"Received webhook: {event} for session {session_key}")
-        logger.debug(f"Webhook payload: {json.dumps(payload, indent=2)}")
+    if event in ('media.play', 'media.resume'):
+        state.playing(key)
+    elif event == 'media.stop':
+        state.not_playing(key, 'stopped')
+    elif event == 'media.pause':
+        state.not_playing(key, 'paused')
+    elif event == 'media.buffer':
+        state.not_playing(key, 'buffered')
+    else:
+        logger.debug(f"Ignoring event {event}")
 
-        # Check if this is a remote session using Player data
-        is_remote = True  # Default to remote for webhook events
-        if isinstance(player, dict):
-            if 'local' in player:
-                is_remote = not bool(player.get('local'))
-            elif 'Local' in player:
-                is_remote = not bool(player.get('Local'))
-
-        session_type = "remote" if is_remote else "local"
-        logger.info(f"Session {session_key} is {session_type}")
-
-        # Only handle remote sessions
-        if not is_remote:
-            logger.info(f"Ignoring local session: {session_key}")
-            return jsonify({'status': 'ignored', 'event': event, 'reason': 'local_session'}), 200
-
-        # Handle different event types for remote sessions only
-        if event in ('media.play', 'media.resume'):
-            state_manager.add_remote_session(session_key)
-        elif event == 'media.stop':
-            # Stream ended - start stop delay timer (don't remove immediately!)
-            state_manager.mark_remote_not_playing(session_key, reason="stopped")
-        elif event == 'media.pause':
-            state_manager.mark_remote_not_playing(session_key, reason="paused")
-        elif event == 'media.buffer':
-            state_manager.mark_remote_not_playing(session_key, reason="buffered")
-        else:
-            logger.debug(f"Ignoring webhook event: {event}")
-
-        return jsonify({'status': 'success', 'event': event, 'session_type': session_type}), 200
-
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON decode error in webhook: {e}")
-        return jsonify({'error': 'Invalid JSON payload'}), 400
-    except Exception as e:
-        logger.error(f"Error processing webhook: {e}")
-        return jsonify({'error': str(e)}), 500
+    return jsonify({'status': 'ok', 'event': event}), 200
 
 
-@app.route('/webhook-test', methods=['POST', 'GET'])
-def webhook_test():
-    """Echo whatever Plex sent, to debug webhook payload formats."""
-    logger.info(f"Webhook test - Method: {request.method}")
-    logger.info(f"Content-Type: {request.content_type}")
-    logger.info(f"Headers: {dict(request.headers)}")
-
-    if request.method == 'POST':
-        logger.info(f"Form data: {dict(request.form)}")
-        logger.info(f"Raw data: {request.data[:500]}")
-
-        if request.is_json:
-            logger.info(f"JSON data: {request.get_json(silent=True)}")
-        elif request.form and 'payload' in request.form:
-            try:
-                logger.info(f"Form payload JSON: {json.loads(request.form['payload'])}")
-            except json.JSONDecodeError:
-                logger.info(f"Form payload (not JSON): {request.form['payload']}")
-
-    return jsonify({'status': 'test_complete', 'timestamp': datetime.now().isoformat()})
-
-
-@app.route('/status', methods=['GET'])
-def get_status():
-    """Get current application status."""
-    if not state_manager:
+@app.route('/health')
+def health():
+    if state is None:
         return jsonify({'status': 'initializing'}), 503
-    return jsonify(state_manager.get_status())
+    snapshot = state.status()
+    ok = snapshot['plex_connected'] and snapshot['qbt_connected']
+    return jsonify({'status': 'healthy' if ok else 'unhealthy', **snapshot}), 200 if ok else 503
+
+
+@app.route('/status')
+def status():
+    if state is None:
+        return jsonify({'status': 'initializing'}), 503
+    return jsonify(state.status())
+
+
+# -- entry point --------------------------------------------------------
 
 
 def polling_loop():
-    """Background polling loop to sync with Plex server."""
     logger.info(
-        f"Starting polling loop (interval: {config.polling_interval}s, "
-        f"stop delay: {config.stop_delay_seconds}s, "
-        f"pause/buffer delay: {config.pause_buffer_delay_seconds}s)"
+        f"Polling every {config.polling_interval}s "
+        f"(stop delay {config.stop_delay_seconds}s, "
+        f"pause/buffer delay {config.pause_buffer_delay_seconds}s)"
     )
-
-    while not state_manager.shutdown_requested:
+    while not state.shutdown:
         try:
-            state_manager.sync_plex_sessions()
-            # Expire timers even if the Plex sync above bailed out, so alternative
-            # speeds can't get stuck on when Plex is unreachable.
-            state_manager.tick()
+            state.sync()
+            state.tick()
         except Exception as e:
-            logger.error(f"Error in polling loop: {e}")
-
-        # Sleep with early exit if shutdown requested
+            logger.error(f"Polling error: {e}")
         for _ in range(config.polling_interval):
-            if state_manager.shutdown_requested:
+            if state.shutdown:
                 break
             time.sleep(1)
 
-    logger.info("Polling loop stopped")
-
-
-def signal_handler(signum, frame):
-    """Handle graceful shutdown signals."""
-    logger.info(f"Received signal {signum}, shutting down...")
-    if state_manager:
-        state_manager.shutdown_requested = True
-    sys.exit(0)
-
 
 def main():
-    """Main application entry point."""
-    global state_manager
+    global state
 
-    # Validate required configuration
-    if not config.plex_token:
-        logger.error("PLEX_TOKEN environment variable is required")
-        sys.exit(1)
-
-    if not config.qbt_username or not config.qbt_password:
-        logger.error(
-            "QBITTORRENT_USERNAME and QBITTORRENT_PASSWORD environment variables are required"
+    missing = [
+        name
+        for name, value in (
+            ('PLEX_TOKEN', config.plex_token),
+            ('QBITTORRENT_USERNAME', config.qbt_username),
+            ('QBITTORRENT_PASSWORD', config.qbt_password),
         )
+        if not value
+    ]
+    if missing:
+        logger.error(f"Missing required environment variables: {', '.join(missing)}")
         sys.exit(1)
 
-    state_manager = StateManager(config)
+    state = StateManager(config)
 
-    # Setup signal handlers for graceful shutdown
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    def handle_signal(signum, _frame):
+        logger.info(f"Signal {signum} received, shutting down")
+        state.shutdown = True
+        sys.exit(0)
 
-    # Start background polling thread
-    polling_thread = threading.Thread(target=polling_loop, daemon=True)
-    polling_thread.start()
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
 
-    logger.info(
-        f"Starting Plex-qBittorrent Speed Manager (remote sessions only) "
-        f"on port {config.http_port}"
-    )
+    threading.Thread(target=polling_loop, daemon=True).start()
 
-    try:
-        serve(app, host='0.0.0.0', port=config.http_port, threads=8)
-    except KeyboardInterrupt:
-        logger.info("Received KeyboardInterrupt")
-    finally:
-        if state_manager:
-            state_manager.shutdown_requested = True
-        logger.info("Application shutdown complete")
+    logger.info(f"Listening on port {config.http_port} (remote Plex sessions only)")
+    serve(app, host='0.0.0.0', port=config.http_port, threads=8)
 
 
 if __name__ == '__main__':
