@@ -40,8 +40,10 @@ class Config:
     plex_timeout: int = int(os.getenv('PLEX_TIMEOUT', '10'))
     qbt_timeout: int = int(os.getenv('QBITTORRENT_TIMEOUT', '10'))
     # How often to re-read qBittorrent purely to detect an external change.
-    # Changes we initiate are applied immediately regardless.
-    drift_check_seconds: int = int(os.getenv('DRIFT_CHECK_SECONDS', '30'))
+    # Kept deliberately slow: the Web UI is usually the busiest thing here, and
+    # this poll earns nothing when no speed change is needed. Changes we
+    # initiate are applied immediately regardless of this interval.
+    drift_check_seconds: int = int(os.getenv('DRIFT_CHECK_SECONDS', '60'))
     log_level: str = os.getenv('LOG_LEVEL', 'INFO')
     http_port: int = int(os.getenv('HTTP_PORT', '5252'))
 

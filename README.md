@@ -51,7 +51,7 @@ Update with `docker compose pull && docker compose up -d`. Every push to `main` 
 | `PAUSE_BUFFER_DELAY_SECONDS` | `60` | Grace period after a pause or buffer |
 | `PLEX_TIMEOUT` | `10` | Plex read timeout, seconds |
 | `QBITTORRENT_TIMEOUT` | `10` | qBittorrent read timeout — raise if a busy Web UI logs read timeouts |
-| `DRIFT_CHECK_SECONDS` | `30` | How often to re-read qBittorrent purely to catch an externally-made change. Speed changes this service makes are applied immediately regardless |
+| `DRIFT_CHECK_SECONDS` | `60` | How often to re-read qBittorrent purely to catch an externally-made change. Speed changes this service makes are applied immediately regardless, so raise this freely if qBittorrent is busy |
 | `LOG_LEVEL` | `INFO` | `DEBUG` logs every session's local/remote decision |
 | `HTTP_PORT` | `5252` | Listen port |
 
