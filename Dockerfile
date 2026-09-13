@@ -5,7 +5,7 @@
 FROM python:3.13-alpine
 
 LABEL org.opencontainers.image.title="plex-qbt-manager" \
-      org.opencontainers.image.description="Toggles qBittorrent alternative speed limits based on remote Plex playback" \
+      org.opencontainers.image.description="Adjusts qBittorrent upload limits using remote Plex stream bandwidth" \
       org.opencontainers.image.source="https://github.com/MonkeyGoneWIld/plex-qbt-manager" \
       org.opencontainers.image.licenses="MIT"
 
@@ -26,7 +26,7 @@ RUN pip install --no-cache-dir --upgrade setuptools \
     && rm -f /usr/local/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip3.* \
     && if python -c "import pip" 2>/dev/null; then echo "pip survived removal"; exit 1; fi
 
-COPY app.py .
+COPY app.py controller.py ./
 
 # uid pinned to 1000 so an existing bind-mounted logs dir stays writable
 RUN adduser -D -u 1000 app \
