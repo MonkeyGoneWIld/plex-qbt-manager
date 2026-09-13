@@ -46,6 +46,12 @@ class Config:
     min_upload_mib: Decimal = field(default_factory=lambda: os.getenv('MIN_UPLOAD_MIB', '1'))
     bandwidth_multiplier: Decimal = field(default_factory=lambda: os.getenv('BANDWIDTH_MULTIPLIER', '1'))
     plex_stale_seconds: int = field(default_factory=lambda: os.getenv('PLEX_STALE_SECONDS', '120'))
+    theater_url: str = field(default_factory=lambda: os.getenv('THEATER_URL', ''))
+    theater_api_key: str = field(default_factory=lambda: os.getenv('THEATER_API_KEY', ''))
+    theater_bandwidth_factor: Decimal = field(default_factory=lambda: os.getenv('THEATER_BANDWIDTH_FACTOR', '1'))
+    theater_poll_interval_seconds: int = field(default_factory=lambda: os.getenv('THEATER_POLL_INTERVAL_SECONDS', '5'))
+    theater_timeout_seconds: int = field(default_factory=lambda: os.getenv('THEATER_TIMEOUT_SECONDS', '3'))
+    theater_stale_seconds: int = field(default_factory=lambda: os.getenv('THEATER_STALE_SECONDS', '30'))
 
     def __post_init__(self):
         validate_config(self)
@@ -58,7 +64,7 @@ class RedactingFormatter(logging.Formatter):
     def __init__(self, cfg):
         super().__init__('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         self.secrets = set()
-        for secret in (cfg.plex_token, cfg.qbt_password):
+        for secret in (cfg.plex_token, cfg.qbt_password, cfg.theater_api_key):
             if secret:
                 self.secrets.update((secret, quote(secret, safe=''), quote_plus(secret)))
 
@@ -208,6 +214,9 @@ def main():
                 config.stop_delay_seconds, config.debounce_seconds, config.drift_check_seconds,
                 config.plex_stale_seconds, config.plex_timeout, config.qbt_timeout)
     state = StateManager(config)
+    logger.info('Theater integration enabled=%s factor=%s poll=%ss timeout=%ss stale=%ss; single-viewer factor=1',
+                bool(config.theater_url), config.theater_bandwidth_factor,
+                config.theater_poll_interval_seconds, config.theater_timeout_seconds, config.theater_stale_seconds)
 
     def handle_signal(signum, _frame):
         logger.info(f"Signal {signum} received, shutting down")

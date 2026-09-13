@@ -276,7 +276,7 @@ def test_missing_bandwidth_retains_last_known(rig):
     assert rig.q.prefs['alt_up_limit'] == 11082752
 
 
-def test_plex_failure_holds_then_minimum_then_recovers(rig):
+def test_plex_failure_holds_then_disables_then_recovers(rig):
     rig.poll(0, xml_session())
     rig.poll(10, xml_session(state='paused'))
     previous = rig.q.prefs['alt_up_limit']
@@ -286,7 +286,7 @@ def test_plex_failure_holds_then_minimum_then_recovers(rig):
     assert not rig.m.status()['plex_connected']
     rig.poll(130)
     assert rig.m.stale and not rig.m.sessions
-    assert rig.q.mode and rig.q.prefs['alt_up_limit'] == MIB
+    assert not rig.q.mode and rig.q.prefs['alt_up_limit'] == previous
     rig.p.query.side_effect = None
     rig.poll(135)
     assert not rig.m.stale and not rig.q.mode
@@ -298,7 +298,7 @@ def test_startup_plex_failure_does_not_assume_empty(rig):
     rig.poll(0)
     assert rig.q.mode and not rig.q.calls
     rig.poll(120)
-    assert rig.q.mode and rig.q.prefs['alt_up_limit'] == MIB
+    assert not rig.q.mode and rig.q.prefs['alt_up_limit'] == 1024
 
 
 def test_malformed_snapshot_is_not_empty(rig):
@@ -457,7 +457,7 @@ def test_stale_fallback_toggle_only_does_not_overwrite_preferences(rig):
     rig.m.cfg.dynamic_upload_enabled = False
     rig.p.query.side_effect = TimeoutError()
     rig.poll(120)
-    assert rig.q.mode and rig.q.prefs['alt_up_limit'] == 1024
+    assert not rig.q.mode and rig.q.prefs['alt_up_limit'] == 1024
 
 
 def test_duplicate_hints_in_one_cycle_do_not_extend_pause_forever(rig):

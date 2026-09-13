@@ -26,7 +26,7 @@ RUN pip install --no-cache-dir --upgrade setuptools \
     && rm -f /usr/local/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip3.* \
     && if python -c "import pip" 2>/dev/null; then echo "pip survived removal"; exit 1; fi
 
-COPY app.py controller.py ./
+COPY app.py controller.py theater.py ./
 
 # uid pinned to 1000 so an existing bind-mounted logs dir stays writable
 RUN adduser -D -u 1000 app \

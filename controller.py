@@ -10,6 +10,8 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
+from urllib.parse import urlsplit
+from theater import Theater
 
 from plexapi.server import PlexServer
 from qbittorrentapi import Client as QBittorrentClient
@@ -31,7 +33,8 @@ def decimal_value(value, name):
 def validate_config(cfg):
     for name in ('polling_interval', 'debounce_seconds', 'stop_delay_seconds',
                  'pause_buffer_delay_seconds', 'plex_timeout', 'qbt_timeout',
-                 'drift_check_seconds', 'plex_stale_seconds', 'http_port'):
+                 'drift_check_seconds', 'plex_stale_seconds', 'http_port',
+                 'theater_poll_interval_seconds', 'theater_timeout_seconds', 'theater_stale_seconds'):
         value = decimal_value(getattr(cfg, name), name.upper())
         minimum = 0 if name in ('debounce_seconds', 'stop_delay_seconds', 'pause_buffer_delay_seconds') else 1
         if value != int(value) or value < minimum:
@@ -43,11 +46,17 @@ def validate_config(cfg):
     if enabled not in ('true', 'false', '1', '0', 'yes', 'no'):
         raise ValueError('DYNAMIC_UPLOAD_ENABLED must be true or false')
     cfg.dynamic_upload_enabled = enabled in ('true', '1', 'yes')
-    for name in ('max_upload_mib', 'min_upload_mib', 'bandwidth_multiplier'):
+    for name in ('max_upload_mib', 'min_upload_mib', 'bandwidth_multiplier', 'theater_bandwidth_factor'):
         value = decimal_value(getattr(cfg, name), name.upper())
         if value <= 0:
             raise ValueError(f'{name.upper()} must be greater than zero')
         setattr(cfg, name, value)
+    if cfg.theater_url:
+        url = urlsplit(cfg.theater_url)
+        if url.scheme not in ('http', 'https') or not url.hostname or url.username or url.password or url.query or url.fragment:
+            raise ValueError('THEATER_URL must be an HTTP(S) URL without credentials, query or fragment')
+        if not cfg.theater_api_key or '\n' in cfg.theater_api_key or '\r' in cfg.theater_api_key:
+            raise ValueError('THEATER_API_KEY is required when THEATER_URL is set')
     if cfg.min_upload_mib > cfg.max_upload_mib:
         raise ValueError('MIN_UPLOAD_MIB must not exceed MAX_UPLOAD_MIB')
     cfg.min_upload_bps = int((cfg.min_upload_mib * MIB).to_integral_value(rounding=ROUND_CEILING))
@@ -79,9 +88,16 @@ class Observation:
     user: str
     playback: str
     bandwidth_kbps: int | None
+    remote: bool = True
+    session_id: str = ''
+    transcode_key: str = ''
+    user_id: str = ''
+    theater_revision: tuple | None = None
+    state_since: float | None = None
+    theater_details: dict | None = None
 
 
-def read_observations(root):
+def read_observations(root, include_local=False):
     """Parse raw XML without lazy metadata requests or additional credentials."""
     if root is None or root.tag != 'MediaContainer':
         raise ValueError('Plex returned an invalid session container')
@@ -106,7 +122,7 @@ def read_observations(root):
             pass
         logger.debug('Plex session=%r player=%r rating_key=%r state=%r remote=%s location=%r bandwidth_kbps=%r',
                      key, player.get('machineIdentifier'), item.get('ratingKey'), playback, remote, location, raw)
-        if not remote:
+        if not remote and not include_local:
             continue
         if not local and not location:
             logger.warning('Plex session=%r has no locality; assuming remote', key)
@@ -114,7 +130,10 @@ def read_observations(root):
             logger.warning('Duplicate Plex session=%r ignored', key)
             continue
         result[key] = Observation(key, player.get('machineIdentifier', ''), item.get('ratingKey', ''),
-                                  user.get('title', '') if user is not None else '', playback, bandwidth)
+                                  user.get('title', '') if user is not None else '', playback, bandwidth,
+                                  remote=remote, session_id=session.get('id', '') if session is not None else '',
+                                  transcode_key=item.find('TranscodeSession').get('key', '').rstrip('/').split('/')[-1] if item.find('TranscodeSession') is not None else '',
+                                  user_id=user.get('id', '') if user is not None else '')
     return result
 
 
@@ -133,8 +152,9 @@ class Session:
 
     def snapshot(self, now):
         return {'state': self.playback, 'reason': self.playback if self.since is not None else None,
-                'last_playing': self.last_playing, 'bandwidth_kbps': self.bandwidth_kbps,
-                'bandwidth_mbps': self.bandwidth_kbps / 1000 if self.bandwidth_kbps is not None else None,
+                'last_playing': self.last_playing, 'bandwidth_kbps': float(self.bandwidth_kbps) if self.bandwidth_kbps is not None else None,
+                'theater': self.observation.theater_details,
+                'bandwidth_mbps': float(self.bandwidth_kbps / 1000) if self.bandwidth_kbps is not None else None,
                 'bandwidth_source': self.bandwidth_source, 'seconds_remaining': self.remaining(now)}
 
 
@@ -168,6 +188,7 @@ class StateManager:
         self.retry_qbt = True
         self.last_decision = None
         self.cycle = 0
+        self.theater = Theater(cfg, clock) if cfg.theater_url else None
         self._connect()
 
     @staticmethod
@@ -243,7 +264,7 @@ class StateManager:
         try:
             if self.plex is None:
                 raise ConnectionError('Plex unavailable')
-            observations = read_observations(self.plex.query('/status/sessions'))
+            observations = read_observations(self.plex.query('/status/sessions'), include_local=self.theater is not None)
         except Exception as exc:
             with self.lock:
                 self.last_plex_ok = False
@@ -254,12 +275,25 @@ class StateManager:
                 self.plex = None
             return False
         now = self.clock()
+        if self.theater:
+            self.theater.poll()
+            observations = self.theater.overlay(observations, str(getattr(self.plex, 'machineIdentifier', '')))
+            now = self.clock()
         with self.lock:
             if self.plex_failures or self.stale:
                 logger.info('Plex recovered after failures=%s; applying fresh snapshot', self.plex_failures)
             self.last_plex_success, self.last_plex_ok = now, True
             self.plex_failures, self.stale = 0, False
             resumed = self._resumed_keys(observations, now)
+            if self.theater:
+                owned = [entry['base'] for entry in self.theater.owned.values()]
+                for key in list(self.sessions):
+                    obs = self.sessions[key].observation
+                    if obs.theater_revision is None and any(
+                            (obs.session_id and obs.session_id == base.session_id) or
+                            (obs.transcode_key and obs.transcode_key == base.transcode_key) for base in owned):
+                        del self.sessions[key]
+                        logger.info('Session=%r transferred to exact Theater ownership; ordinary reservation removed', key)
             for key, obs in observations.items():
                 tracked = self.sessions.get(key)
                 if tracked and (tracked.observation.player_id, tracked.observation.rating_key, tracked.observation.user) != (obs.player_id, obs.rating_key, obs.user):
@@ -267,12 +301,19 @@ class StateManager:
                     del self.sessions[key]
                     tracked = None
                 active = obs.playback in ('playing', 'buffering')
+                theater_changed = obs.theater_revision is not None and (tracked is None or tracked.observation.theater_revision != obs.theater_revision)
                 if tracked is None:
-                    if not active and key not in resumed:
+                    if not active and key not in resumed and not theater_changed:
                         logger.debug('Session=%r idle and not previously playing; ignored', key)
                         continue
+                    if not active and obs.state_since is not None:
+                        grace = self.cfg.stop_delay_seconds if obs.playback == 'stopped' else self.cfg.pause_buffer_delay_seconds
+                        if now - obs.state_since >= grace:
+                            continue
                     tracked = self.sessions[key] = Session(obs)
                 tracked.observation = obs
+                if theater_changed:
+                    tracked.since = None
                 if key in resumed:
                     tracked.since = None
                     tracked.playback = 'resumed'
@@ -295,7 +336,7 @@ class StateManager:
                     if obs.playback == 'playing':
                         tracked.last_playing = datetime.now(timezone.utc).isoformat()
                 elif previous != obs.playback or tracked.since is None:
-                    tracked.since = now
+                    tracked.since = obs.state_since if obs.state_since is not None else now
                     tracked.delay = self.cfg.stop_delay_seconds if obs.playback == 'stopped' else self.cfg.pause_buffer_delay_seconds
                 tracked.playback = obs.playback
                 if previous != tracked.playback:
@@ -328,10 +369,12 @@ class StateManager:
                 want, limit = self.desired_mode, self.desired_upload_bps
                 logger.debug('cycle=%s holding decision mode=%s upload_bps=%s Plex_age_seconds=%.1f',
                              self.cycle, want, limit, age)
+                # Freeze actual qBittorrent settings, including pending writes/drift repair.
+                return
             else:
                 if not fresh:
                     if not self.stale:
-                        logger.error('Plex data stale age=%.1fs; clearing stale sessions and enabling protective limits', age)
+                        logger.error('Plex data stale age=%.1fs timeout=%ss; disabling alternative speeds; upload preference unchanged', age, self.cfg.plex_stale_seconds)
                     self.stale = True
                     self.sessions.clear()
                 else:
@@ -339,8 +382,8 @@ class StateManager:
                         logger.info('Session=%r grace expired state=%s; released reservation', key, self.sessions[key].playback)
                         del self.sessions[key]
                 total = sum(s.bandwidth_kbps or 0 for s in self.sessions.values())
-                unknown = self.stale or any(s.bandwidth_kbps is None for s in self.sessions.values())
-                want = self.stale or bool(self.sessions)
+                unknown = any(s.bandwidth_kbps is None for s in self.sessions.values()) or bool(self.theater and self.theater.uncertain)
+                want = not self.stale and (bool(self.sessions) or unknown)
                 calculated = upload_budget(self.cfg, total, unknown) if want and self.cfg.dynamic_upload_enabled else None
                 limit = qbt_budget(self.cfg, calculated) if calculated is not None else None
                 self.calculated_upload_bps = calculated
@@ -356,9 +399,9 @@ class StateManager:
             for key, tracked in self.sessions.items():
                 logger.debug('cycle=%s session=%r snapshot=%s', self.cycle, key, tracked.snapshot(now))
         if want is not None:
-            self._reconcile(want, limit)
+            self._reconcile(want, limit, force=self.stale)
 
-    def _reconcile(self, want, limit):
+    def _reconcile(self, want, limit, force=False):
         # Serialised by refresh_lock; network I/O never holds the status lock.
         now = self.clock()
         due = now - self.last_drift_check >= self.cfg.drift_check_seconds
@@ -386,7 +429,7 @@ class StateManager:
                     self.applied_upload_bps = actual_limit
             change = actual != want or (limit is not None and actual_limit != limit)
             protective = want and (not actual or (limit is not None and (actual_limit <= 0 or limit < actual_limit)))
-            if change and not protective and now - self.last_change < self.cfg.debounce_seconds:
+            if change and not protective and not force and now - self.last_change < self.cfg.debounce_seconds:
                 logger.debug('qBittorrent relaxation debounced remaining=%.2fs', self.cfg.debounce_seconds - (now - self.last_change))
                 self.retry_qbt = True
                 return
@@ -433,7 +476,8 @@ class StateManager:
                 'alt_speeds_enabled': self.alt_speeds,
                 'desired_alt_speeds_enabled': self.desired_mode,
                 'dynamic_upload_enabled': self.cfg.dynamic_upload_enabled,
-                'reserved_bandwidth_mbps': sum(s.bandwidth_kbps or 0 for s in self.sessions.values()) / 1000,
+                'reserved_bandwidth_mbps': float(sum(s.bandwidth_kbps or 0 for s in self.sessions.values()) / 1000),
+                'theater': self.theater.status() if self.theater else {'enabled': False},
                 'unknown_bandwidth_sessions': sum(s.bandwidth_kbps is None for s in self.sessions.values()),
                 'min_upload_mib': float(self.cfg.min_upload_mib), 'max_upload_mib': float(self.cfg.max_upload_mib),
                 'bandwidth_multiplier': float(self.cfg.bandwidth_multiplier),

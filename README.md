@@ -53,7 +53,7 @@ Missing, zero, or invalid session bandwidth retains that session's last positive
 
 ## Connection failures
 
-Brief Plex failures retain the previous desired mode and upload limit, even if a grace timer would otherwise expire. After `PLEX_STALE_SECONDS` without a successful poll, stale session records are cleared and protective alternative mode is enabled. In dynamic mode, this uses `MIN_UPLOAD_MIB`; in toggle-only mode it uses qBittorrent's existing alternative values. It remains protective until a successful Plex poll determines the current sessions. `/health` reports 503 throughout the failure. This avoids treating unavailable Plex data as proof that all streams stopped.
+Brief Plex failures freeze the current qBittorrent settings, including pending writes and drift correction, even if a grace timer would otherwise expire. After `PLEX_STALE_SECONDS` without a successful poll (120 seconds by default), stale session records are cleared and **alternative speeds are disabled**. The saved alternative upload preference is left unchanged. This timeout also applies when Plex is unavailable at startup. Fresh Plex data resumes normal control automatically. `/health` reports 503 throughout the failure. The timeout is checked after each request completes, so request duration and polling cadence affect the exact time of the action.
 
 qBittorrent failures are retried on the next refresh; three failed reconciliations discard the client and trigger reconnection. A successful read alone does not erase repeated write failures. An upload write must pass readback verification before the manager enables alternative mode. `/status` distinguishes the desired limit from the last observed/applied value, which can be stale while disconnected.
 
@@ -100,7 +100,7 @@ Update with `docker compose pull && docker compose up -d`. Every push to `main` 
 | `MAX_UPLOAD_MIB` | `12` | Maximum dynamic upload budget in MiB/s |
 | `MIN_UPLOAD_MIB` | `1` | Minimum dynamic upload in MiB/s; must be positive and <= maximum |
 | `BANDWIDTH_MULTIPLIER` | `1` | Positive multiplier on the bandwidth deduction; e.g. `1.5` |
-| `PLEX_STALE_SECONDS` | `120` | Time without a successful Plex poll before protective fallback |
+| `PLEX_STALE_SECONDS` | `120` | Time without a successful Plex poll before disabling alternative speeds |
 | `LOG_LEVEL` | `INFO` | `DEBUG` adds per-poll sessions, timers, calculations, readbacks, and webhook matching |
 | `HTTP_PORT` | `5252` | Listen port |
 
@@ -138,7 +138,7 @@ Everything goes to stdout, rotated by Docker's json-file driver (10 MB Ã— 3) â€”
 
 A rotating `/app/logs/app.log` (5 MB Ã— 5) is written inside the container as well. It's discarded whenever the container is recreated, including on every update; mount `/app/logs` to an absolute host path to keep it.
 
-`INFO` records startup settings, connections, bandwidth changes, state transitions, grace expiry, budget changes, and verified qBittorrent writes. `WARNING`/`ERROR` record missing bandwidth, ambiguous hints, external edits, connection failures, readback mismatches, and protective fallback.
+`INFO` records startup settings, connections, bandwidth changes, state transitions, grace expiry, budget changes, and verified qBittorrent writes. `WARNING`/`ERROR` record missing bandwidth, ambiguous hints, external edits, connection failures, readback mismatches, and Plex stale-timeout release.
 
 `DEBUG` adds every Plex session's locality/state/bandwidth, retained bandwidth source, remaining timers, per-cycle calculations and duration, qBittorrent readbacks/skipped writes/debounce decisions, and webhook identity matching. A `cycle` number ties calculations and reads together. Full webhook payloads are never logged. Configured tokens/passwords and URL credentials are redacted, including in exception messages. HTTP-library chatter stays at WARNING.
 
@@ -170,3 +170,74 @@ docker compose up -d --pull never --force-recreate
 ## License
 
 [MIT](LICENSE)
+
+
+## Discord Theater integration
+
+Use Theater branch `feature/qbt-manager-integration` alongside this manager branch.
+Set `QBT_MANAGER_API_KEY` in Theater to a long random secret and set the same
+secret as `THEATER_API_KEY` in the manager. The Plex token remains server-side;
+no extra Plex account credentials or manual bot-account setting is needed.
+
+Manager environment example (for both services sharing one internet connection):
+
+```dotenv
+DYNAMIC_UPLOAD_ENABLED=true
+THEATER_URL=http://plex-discord-theater:3000
+THEATER_API_KEY=replace-with-your-shared-secret
+THEATER_BANDWIDTH_FACTOR=0.8
+THEATER_POLL_INTERVAL_SECONDS=5
+THEATER_TIMEOUT_SECONDS=3
+THEATER_STALE_SECONDS=30
+```
+
+`THEATER_URL` must be reachable from the manager container. Use HTTPS when the
+connection crosses an untrusted network. Leave it empty to disable integration.
+The private read-only endpoint is `/api/integrations/qbt-manager/state`, with
+Bearer authentication, no browser credentials, no caching, and no token in its
+response. The manager samples it on successful Plex polling cycles, at most once
+per `THEATER_POLL_INTERVAL_SECONDS`; a slower `POLLING_INTERVAL` also limits its
+frequency. HTTP timeout bounds each attempt.
+
+For each audio/subtitle variant, count unique connected users with the player
+open, including the host. Browsing/voice-only users are excluded. Buffering users
+still count; dead WebSockets disappear after Theater's existing ping timeout.
+The estimated upload bandwidth per variant is:
+
+- No viewers: release after `STOP_DELAY_SECONDS`, retaining the prior reservation during grace.
+- One viewer: Plex bandwidth × 1 (no P2P factor).
+- Two or more viewers: Plex bandwidth × viewers × `THEATER_BANDWIDTH_FACTOR`.
+
+For three variants with 12 Mbps each and audiences of 3, 2 and 1, factor 0.8:
+`12 × 3 × 0.8 + 12 × 2 × 0.8 + 12 = 60 Mbps`.
+Add ordinary remote Plex streams, then apply `BANDWIDTH_MULTIPLIER` to that sum,
+convert decimal Mbps to bytes/s, subtract from `MAX_UPLOAD_MIB`, clamp to min/max,
+and round to qBittorrent's KiB/s precision. This is a configurable P2P estimate,
+not measurement of bytes actually exchanged between viewers.
+
+Matching uses the real Plex server identity plus exact HLS Session ID, with the
+Plex transcode key as fallback. Matching happens before LAN filtering because
+Theater's Plex connection can be local while its viewers are remote. Its matched
+Plex row is **replaced**, not added twice. `/status` shows the Plex account ID and
+name for each matched variant. Ordinary streams from the same account remain
+independent; account names and movie titles are never used as matching shortcuts.
+
+Theater playback state overrides Plex for matched streams: Plex may intentionally
+keep transcoding during a Discord pause. Pauses retain their previous bandwidth
+for `PAUSE_BUFFER_DELAY_SECONDS`. A state revision and time-in-state distinguish
+a second pause even when the manager misses the intervening resume. Retained
+ownership suppresses lingering Plex sessions after pause/stop grace expires.
+
+A brief Theater failure uses the last snapshot until `THEATER_STALE_SECONDS`.
+Missing, stale, foreign-server, or ambiguous integration data selects the minimum
+upload budget while Plex remains reachable, rather than trusting incomplete
+viewer counts. This differs from a **Plex outage**, which freezes settings and
+then disables alternative mode as described above. Recovery is automatic.
+With VPS relay enabled, each occupied variant reserves one home-upload feed;
+the per-viewer P2P factor does not apply. Keep relay disabled for direct delivery.
+
+`LOG_LEVEL=DEBUG` logs snapshot sequence/age, variant, viewer count, Plex account,
+base bandwidth, applied weight, effective bandwidth, matching and pause revision.
+`/status` includes integration freshness and each variant's calculation inputs.
+Secrets are redacted. Configure these branches by building their checked-out
+source; publishing a GitHub branch alone does not update the `latest` image.
