@@ -1,5 +1,9 @@
 # Plex-qBittorrent Speed Manager
 
+Current release: **v1.0.0**. Container images are published as
+`ghcr.io/monkeygonewild/plex-qbt-manager:latest` and
+`ghcr.io/monkeygonewild/plex-qbt-manager:1.0.0`.
+
 Turns qBittorrent's alternative speed limits on for **remote Plex streams**. Optional dynamic upload control automatically subtracts their combined bandwidth from a user-configured maximum, with a minimum upload floor and a reduction multiplier. It uses your existing Plex URL and token; Tautulli, Tracearr, and extra credentials are not required.
 
 LAN playback is ignored because it does not use the server's internet upload bandwidth.
@@ -174,7 +178,7 @@ docker compose up -d --pull never --force-recreate
 
 ## Discord Theater integration
 
-Use Theater branch `feature/qbt-manager-integration` alongside this manager branch.
+Use Plex Discord Theater v1.0.3 or newer alongside plex-qbt-manager v1.0.0 or newer.
 Set `QBT_MANAGER_API_KEY` in Theater to a long random secret and set the same
 secret as `THEATER_API_KEY` in the manager. The Plex token remains server-side;
 no extra Plex account credentials or manual bot-account setting is needed.
@@ -239,5 +243,5 @@ the per-viewer P2P factor does not apply. Keep relay disabled for direct deliver
 `LOG_LEVEL=DEBUG` logs snapshot sequence/age, variant, viewer count, Plex account,
 base bandwidth, applied weight, effective bandwidth, matching and pause revision.
 `/status` includes integration freshness and each variant's calculation inputs.
-Secrets are redacted. Configure these branches by building their checked-out
-source; publishing a GitHub branch alone does not update the `latest` image.
+Secrets are redacted. Released multi-architecture images are available through
+the GHCR package names documented above.
