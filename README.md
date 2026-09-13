@@ -205,11 +205,11 @@ still count; dead WebSockets disappear after Theater's existing ping timeout.
 The estimated upload bandwidth per variant is:
 
 - No viewers: release after `STOP_DELAY_SECONDS`, retaining the prior reservation during grace.
-- One viewer: Plex bandwidth × 1 (no P2P factor).
-- Two or more viewers: Plex bandwidth × viewers × `THEATER_BANDWIDTH_FACTOR`.
+- One viewer: Plex bandwidth Ã— 1 (no P2P factor).
+- Two or more viewers: Plex bandwidth Ã— viewers Ã— `THEATER_BANDWIDTH_FACTOR`.
 
 For three variants with 12 Mbps each and audiences of 3, 2 and 1, factor 0.8:
-`12 × 3 × 0.8 + 12 × 2 × 0.8 + 12 = 60 Mbps`.
+`12 Ã— 3 Ã— 0.8 + 12 Ã— 2 Ã— 0.8 + 12 = 60 Mbps`.
 Add ordinary remote Plex streams, then apply `BANDWIDTH_MULTIPLIER` to that sum,
 convert decimal Mbps to bytes/s, subtract from `MAX_UPLOAD_MIB`, clamp to min/max,
 and round to qBittorrent's KiB/s precision. This is a configurable P2P estimate,
