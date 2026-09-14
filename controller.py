@@ -194,6 +194,7 @@ class StateManager:
         # bandwidth for its full stop grace after the next item has started.
         self.device_sessions = {}
         self.retired_device_sessions = {}
+        self.suppressed_theater_sessions = set()
         self._connect()
 
     @staticmethod
@@ -344,26 +345,31 @@ class StateManager:
 
     def _reconcile_theater_handoffs(self, observations):
         active_ratings = {}
+        active_sessions = {}
         for obs in observations.values():
             details = obs.theater_details
             if details and obs.playback in ('playing', 'buffering'):
                 active_ratings.setdefault(details['room_id'], set()).add(obs.rating_key)
+                active_sessions.setdefault(details['room_id'], set()).add(obs.key)
         for room_id, ratings in active_ratings.items():
             if len(ratings) != 1:
                 logger.warning('Theater room=%r reports multiple active rating keys=%r; retaining reservations',
                                room_id, sorted(ratings))
                 continue
             current_rating = next(iter(ratings))
+            current_sessions = active_sessions[room_id]
             for key in list(observations):
                 obs = observations[key]
                 details = obs.theater_details
-                if details and details['room_id'] == room_id and obs.rating_key != current_rating:
+                if (details and details['room_id'] == room_id and
+                        (obs.rating_key != current_rating or key not in current_sessions)):
                     observations.pop(key)
             released = []
             for key in list(self.sessions):
                 obs = self.sessions[key].observation
                 details = obs.theater_details
-                if details and details['room_id'] == room_id and obs.rating_key != current_rating:
+                if (details and details['room_id'] == room_id and
+                        (obs.rating_key != current_rating or key not in current_sessions)):
                     released.append((key, obs.rating_key))
                     del self.sessions[key]
             if released:
@@ -371,8 +377,9 @@ class StateManager:
                             room_id, current_rating, released)
 
     def _suppress_pending_theater_handoffs(self, observations):
-        """Avoid a raw Plex duplicate while Theater's slower snapshot catches up."""
+        """Keep unmatched Plex rows for a Theater device out of the budget."""
         theater_by_device = {}
+        raw_seen_keys = {key for key, obs in observations.items() if obs.theater_revision is None}
         for obs in observations.values():
             if obs.theater_revision is None or obs.playback not in ('playing', 'buffering'):
                 continue
@@ -384,16 +391,26 @@ class StateManager:
             if obs.theater_revision is not None or obs.playback not in ('playing', 'buffering'):
                 continue
             identity = self._account_device_identity(obs)
-            prior = [item for item in theater_by_device.get(identity, [])
-                     if item.rating_key != obs.rating_key]
-            if not prior:
+            theater = theater_by_device.get(identity, [])
+            if not theater:
                 continue
             observations.pop(key)
             self.sessions.pop(key, None)
-            logger.info('Plex session=%r rating=%r account=%r player=%r is awaiting Theater ownership; '
-                        'suppressed beside prior Theater rating=%r room=%r', key, obs.rating_key,
-                        identity[0], identity[1], prior[0].rating_key,
-                        prior[0].theater_details.get('room_id'))
+            first_seen = key not in self.suppressed_theater_sessions
+            self.suppressed_theater_sessions.add(key)
+            log = logger.info if first_seen else logger.debug
+            log('Plex session=%r rating=%r account=%r player=%r suppressed because Theater owns this device; '
+                'theater_ratings=%r rooms=%r', key, obs.rating_key, identity[0], identity[1],
+                sorted({item.rating_key for item in theater}),
+                sorted({item.theater_details.get('room_id') for item in theater}))
+        self.suppressed_theater_sessions.intersection_update(raw_seen_keys | set(self.sessions))
+        for key in list(self.sessions):
+            tracked = self.sessions[key]
+            identity = self._device_identity(tracked.observation)
+            if identity in theater_by_device:
+                del self.sessions[key]
+                logger.info('Session=%r removed because Theater owns account=%r player=%r',
+                            key, identity[0], identity[1])
 
     def sync(self):
         if self.plex is None:
@@ -519,6 +536,7 @@ class StateManager:
                     self.sessions.clear()
                     self.device_sessions.clear()
                     self.retired_device_sessions.clear()
+                    self.suppressed_theater_sessions.clear()
                 else:
                     for key in [k for k, s in self.sessions.items() if s.remaining(now) == 0]:
                         logger.info('Session=%r grace expired state=%s; released reservation', key, self.sessions[key].playback)

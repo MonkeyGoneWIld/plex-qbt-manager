@@ -9,6 +9,11 @@ from urllib.request import Request
 logger = logging.getLogger('plex-qbt')
 
 
+def newest_observation(observations):
+    numeric = [(int(obs.key), obs) for obs in observations if str(obs.key).isdigit()]
+    return max(numeric)[1] if len(numeric) == len(observations) else observations[-1]
+
+
 def viewer_weight(count, factor, delivery_mode='direct_p2p'):
     if count == 0:
         return Decimal(0)
@@ -113,13 +118,16 @@ class Theater:
         # When its rating key changes, the old Plex transcodes can linger briefly;
         # retire their ownership now instead of returning them for stop grace.
         active_titles = {}
+        active_sessions = {}
         for stream in streams:
             if stream['viewer_count'] and stream['state'] == 'playing':
                 active_titles.setdefault(stream['room_id'], set()).add(stream['rating_key'])
+                active_sessions.setdefault(stream['room_id'], set()).add(stream['hls_session_id'])
         for sid, old in list(self.owned.items()):
             details = old['observation'].theater_details or {}
             ratings = active_titles.get(details.get('room_id'), set())
-            if len(ratings) != 1 or old['base'].rating_key in ratings:
+            current_sessions = active_sessions.get(details.get('room_id'), set())
+            if len(ratings) != 1 or sid in current_sessions:
                 continue
             base = old['base']
             matched.update(o.key for o in observations.values() if
@@ -133,11 +141,32 @@ class Theater:
         for stream in streams:
             sid = stream['hls_session_id']
             present.add(sid)
+            equivalent_duplicates = False
             exact = [o for o in observations.values() if o.session_id == sid]
             if not exact and stream['plex_transcode_key']:
                 key = stream['plex_transcode_key'].rstrip('/').split('/')[-1]
                 exact = [o for o in observations.values() if o.transcode_key and o.transcode_key == key]
-            if len(exact) > 1 or (exact and exact[0].key in matched):
+            if len(exact) > 1:
+                signatures = {(o.player_id, o.rating_key, o.user_id or o.user)
+                              for o in exact}
+                matched.update(o.key for o in exact)
+                if len(signatures) == 1 and exact[0].rating_key == stream['rating_key']:
+                    selected = newest_observation(exact)
+                    known_bandwidth = [o.bandwidth_kbps for o in exact if o.bandwidth_kbps is not None]
+                    if known_bandwidth:
+                        selected = replace(selected, bandwidth_kbps=max(known_bandwidth))
+                    logger.info('Theater duplicate Plex identity room=%s variant=%s sessions=%r selected=%r; '
+                                'equivalent rows collapsed using bandwidth_kbps=%r',
+                                stream['room_id'], stream['variant_id'], [o.key for o in exact],
+                                selected.key, selected.bandwidth_kbps)
+                    exact = [selected]
+                    equivalent_duplicates = True
+                else:
+                    self.uncertain = True
+                    logger.warning('Theater ambiguous identity room=%s variant=%s sessions=%r; using minimum budget',
+                                   stream['room_id'], stream['variant_id'], [o.key for o in exact])
+                    continue
+            if exact and exact[0].key in matched and not equivalent_duplicates:
                 self.uncertain = True
                 logger.warning('Theater ambiguous identity room=%s variant=%s; using minimum budget', stream['room_id'], stream['variant_id'])
                 continue

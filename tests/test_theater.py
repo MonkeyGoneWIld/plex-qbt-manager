@@ -21,8 +21,8 @@ def snapshot(*streams, server='server-1', instance='boot-1', sequence=1):
                 plex_server_id=server, delivery_mode='direct_p2p', streams=list(streams))
 
 
-def plex(sid='hls-1', key='1', bandwidth='12000', local='1', user='Bot', rating='42'):
-    item = xml_session(key=key, bandwidth=bandwidth, local=local, user=user, rating=rating)
+def plex(sid='hls-1', key='1', bandwidth='12000', local='1', user='Bot', rating='42', player='player-1'):
+    item = xml_session(key=key, bandwidth=bandwidth, local=local, user=user, rating=rating, player=player)
     item.find('Session').set('id', sid)
     item.find('User').set('id', '7')
     return item
@@ -51,7 +51,7 @@ def test_three_track_variants_and_ordinary_same_account(rig, monkeypatch):
     enable(rig, monkeypatch, stream('a', 3), stream('b', 2), stream('c', 1))
     rig.m.cfg.bandwidth_multiplier = Decimal('1.5')
     rig.poll(0, plex('a', '1'), plex('b', '2'), plex('c', '3'),
-             plex('ordinary', '4', bandwidth='5000', local='0'))
+             plex('ordinary', '4', bandwidth='5000', local='0', player='other-player'))
     # Per-variant P2P estimate: 12*(3*.8 + 2*.8 + 1) + ordinary 5 = 65 Mbps.
     assert rig.m.status()['reserved_bandwidth_mbps'] == 65
     assert len(rig.m.sessions) == 4
@@ -153,10 +153,57 @@ def test_episode_handoff_releases_old_room_variants_immediately(rig, monkeypatch
     assert set(t.owned) == {'new-a'}
 
 
+def test_equivalent_duplicate_plex_rows_collapse_to_one_theater_stream(rig, monkeypatch):
+    enable(rig, monkeypatch, stream('shared', viewers=2))
+    rig.poll(0, plex('shared', '10'), plex('shared', '11', bandwidth='13000'))
+    assert set(rig.m.sessions) == {'theater:shared'}
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 20.8
+    assert not rig.m.theater.uncertain
+
+
+def test_unmatched_same_device_row_is_suppressed_beside_theater(rig, monkeypatch):
+    enable(rig, monkeypatch, stream('owned', viewers=2))
+    rig.poll(0, plex('owned', '10'), plex('other', '11'))
+    assert set(rig.m.sessions) == {'theater:owned'}
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 19.2
+
+
 def test_same_title_theater_variants_are_not_collapsed(rig, monkeypatch):
     enable(rig, monkeypatch, stream('a', viewers=3), stream('b', viewers=2))
     rig.poll(0, plex('a', '1'), plex('b', '2'))
     assert set(rig.m.sessions) == {'theater:a', 'theater:b'}
+
+
+def test_replaced_variant_in_same_room_is_released_immediately(rig, monkeypatch):
+    t = enable(rig, monkeypatch, stream('old', viewers=2, rating='42'))
+    rig.poll(0, plex('old', '10', rating='42'))
+    t.snapshot = snapshot(stream('new', viewers=2, revision=2, rating='42'), sequence=2)
+    t.received = 5
+    rig.poll(5, plex('old', '10', rating='42'), plex('new', '11', rating='42'))
+    assert set(rig.m.sessions) == {'theater:new'}
+    assert set(t.owned) == {'new'}
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 19.2
+
+
+def test_duplicate_rows_during_episode_handoff_never_force_minimum(rig, monkeypatch):
+    t = enable(rig, monkeypatch, stream('old', viewers=2, rating='42'))
+    rig.poll(0, plex('old', '10', rating='42'))
+
+    # New Plex rows arrive before Theater changes its snapshot.
+    rig.poll(1, plex('old', '10', rating='42'),
+             plex('new', '11', rating='43'), plex('new', '12', rating='43'))
+    assert set(rig.m.sessions) == {'theater:old'}
+    assert not rig.m.theater.uncertain
+
+    # Theater catches up while both equivalent new rows still exist.
+    t.snapshot = snapshot(stream('new', viewers=2, revision=2, rating='43'), sequence=2)
+    t.received = 5
+    rig.poll(5, plex('old', '10', rating='42'),
+             plex('new', '11', rating='43'), plex('new', '12', rating='43'))
+    assert set(rig.m.sessions) == {'theater:new'}
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 19.2
+    assert not rig.m.theater.uncertain
+    assert rig.q.prefs['alt_up_limit'] != rig.m.cfg.min_upload_bps
 
 
 @pytest.mark.parametrize('server,streams', [('wrong-server', [stream()]), ('server-1', [stream('unmatched')])])
