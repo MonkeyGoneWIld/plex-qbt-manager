@@ -112,7 +112,7 @@ All settings are Docker environment variables.
 
 `MAX_UPLOAD_MIB` and `MIN_UPLOAD_MIB` use MiB/s. Decimal values are supported.
 
-## [Plex Discord Theater](https://github.com/MonkeyGoneWIld/plex-discord-theater) integration
+## Plex Discord Theater integration
 
 [Plex Discord Theater](https://github.com/MonkeyGoneWIld/plex-discord-theater) is
 a Discord Activity for hosting synchronized Plex watch parties. Everyone watches
