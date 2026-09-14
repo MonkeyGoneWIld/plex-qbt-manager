@@ -112,11 +112,16 @@ All settings are Docker environment variables.
 
 `MAX_UPLOAD_MIB` and `MIN_UPLOAD_MIB` use MiB/s. Decimal values are supported.
 
-## Plex Discord Theater integration
+## [Plex Discord Theater](https://github.com/MonkeyGoneWIld/plex-discord-theater) integration
 
-Plex Discord Theater can serve several viewers through Plex sessions that would
-otherwise look like only one viewer. The integration supplies viewer counts and
-playback state while Plex remains the source of bandwidth data.
+[Plex Discord Theater](https://github.com/MonkeyGoneWIld/plex-discord-theater) is
+a Discord Activity for hosting synchronized Plex watch parties. Everyone watches
+inside Discord, with synchronized playback and individual audio and subtitle
+choices.
+
+Because one Theater room can serve several viewers while appearing as only one
+or a few Plex sessions, this integration supplies the manager with viewer counts
+and Discord playback state. Plex remains the source of bandwidth data.
 
 Use Plex Discord Theater v1.0.3 or newer. Set the same long, random secret in
 Theater's `QBT_MANAGER_API_KEY` and the manager's `THEATER_API_KEY`, then add these
