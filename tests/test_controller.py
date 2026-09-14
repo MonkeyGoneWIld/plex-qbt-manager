@@ -419,6 +419,32 @@ def test_reused_session_key_does_not_retain_old_bandwidth(rig):
     assert rig.q.prefs['alt_up_limit'] == MIB
 
 
+def test_same_account_device_handoff_counts_only_new_session(rig):
+    rig.poll(0, xml_session(key='10', rating='episode-1', bandwidth='12000'))
+    rig.poll(5, xml_session(key='10', rating='episode-1', bandwidth='12000'),
+             xml_session(key='11', rating='episode-2', bandwidth='5000'))
+    assert set(rig.m.sessions) == {'11'}
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 5
+    # A lingering old row remains suppressed on subsequent snapshots.
+    rig.poll(10, xml_session(key='10', rating='episode-1', bandwidth='12000'),
+             xml_session(key='11', rating='episode-2', bandwidth='5000'))
+    assert set(rig.m.sessions) == {'11'}
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 5
+
+
+def test_startup_during_device_handoff_selects_newest_session(rig):
+    rig.poll(0, xml_session(key='10', rating='episode-1', bandwidth='12000'),
+             xml_session(key='11', rating='episode-2', bandwidth='5000'))
+    assert set(rig.m.sessions) == {'11'}
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 5
+
+
+def test_same_account_on_different_devices_still_counts_both(rig):
+    rig.poll(0, xml_session(key='10', player='tv', bandwidth='12000'),
+             xml_session(key='11', player='phone', bandwidth='5000'))
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 17
+
+
 def test_status_does_not_block_on_qbt_io(rig):
     entered, release = threading.Event(), threading.Event()
 

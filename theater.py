@@ -109,6 +109,26 @@ class Theater:
         result = {}
         matched = set()
         streams = self.snapshot['streams'] if valid else []
+        # A Theater room can have several audio/subtitle variants for one title.
+        # When its rating key changes, the old Plex transcodes can linger briefly;
+        # retire their ownership now instead of returning them for stop grace.
+        active_titles = {}
+        for stream in streams:
+            if stream['viewer_count'] and stream['state'] == 'playing':
+                active_titles.setdefault(stream['room_id'], set()).add(stream['rating_key'])
+        for sid, old in list(self.owned.items()):
+            details = old['observation'].theater_details or {}
+            ratings = active_titles.get(details.get('room_id'), set())
+            if len(ratings) != 1 or old['base'].rating_key in ratings:
+                continue
+            base = old['base']
+            matched.update(o.key for o in observations.values() if
+                           (o.session_id and o.session_id == sid) or
+                           (base.transcode_key and o.transcode_key == base.transcode_key))
+            del self.owned[sid]
+            logger.info('Theater ownership handoff room=%r old_session=%s old_rating=%r new_rating=%r; '
+                        'lingering Plex session suppressed', details.get('room_id'), sid,
+                        base.rating_key, next(iter(ratings)))
         present = set()
         for stream in streams:
             sid = stream['hls_session_id']

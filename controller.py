@@ -189,6 +189,11 @@ class StateManager:
         self.last_decision = None
         self.cycle = 0
         self.theater = Theater(cfg, clock) if cfg.theater_url else None
+        # Plex may briefly expose both sides of a player handoff. Remember which
+        # session belongs to each account/device so the old item cannot consume
+        # bandwidth for its full stop grace after the next item has started.
+        self.device_sessions = {}
+        self.retired_device_sessions = {}
         self._connect()
 
     @staticmethod
@@ -258,6 +263,109 @@ class StateManager:
         self.hints = pending
         return resumed
 
+    @staticmethod
+    def _device_identity(obs):
+        if obs.theater_revision is not None or not obs.player_id:
+            return None
+        account = obs.user_id or obs.user
+        return (account, obs.player_id) if account else None
+
+    @staticmethod
+    def _newest_session_key(keys):
+        """Prefer Plex's increasing numeric session keys, preserving input order otherwise."""
+        numeric = [(int(key), key) for key in keys if str(key).isdigit()]
+        if len(numeric) == len(keys):
+            return max(numeric)[1]
+        return keys[-1]
+
+    def _reconcile_device_handoffs(self, observations):
+        groups = {}
+        for key, obs in observations.items():
+            identity = self._device_identity(obs)
+            if identity is not None:
+                groups.setdefault(identity, []).append(key)
+
+        for identity, keys in groups.items():
+            active = [key for key in keys if observations[key].playback in ('playing', 'buffering')]
+            current = self.device_sessions.get(identity)
+            retired = self.retired_device_sessions.setdefault(identity, set())
+
+            if current is None:
+                if len(active) == 1:
+                    self.device_sessions[identity] = active[0]
+                    continue
+                # If the service starts during an episode transition, distinct
+                # rating keys still describe one account/device handoff. Plex's
+                # numeric session keys increase, so retain only the newest one.
+                ratings = {observations[key].rating_key for key in active}
+                if len(active) < 2 or len(ratings) < 2:
+                    continue
+                current = self._newest_session_key(active)
+                self.device_sessions[identity] = current
+                retired.update(key for key in keys if key != current)
+                logger.info('Plex device overlap at startup account=%r player=%r sessions=%r selected=%r; '
+                            'older reservations suppressed', identity[0], identity[1], keys, current)
+
+            unseen = [key for key in active if key != current and key not in retired]
+            selected = current if current in keys else None
+            if unseen:
+                selected = self._newest_session_key(unseen)
+                retired.update(key for key in keys if key != selected)
+                retired.add(current)
+                self.device_sessions[identity] = selected
+                old = self.sessions.get(current)
+                logger.info(
+                    'Plex device handoff account=%r player=%r old_session=%r old_rating=%r '
+                    'new_session=%r new_rating=%r; previous reservation released immediately',
+                    identity[0], identity[1], current,
+                    old.observation.rating_key if old else None, selected,
+                    observations[selected].rating_key)
+            elif selected is None and active:
+                # If Plex momentarily shows only a retired side of the handoff,
+                # count one stream without forgetting which session is newest.
+                selected = self._newest_session_key(active)
+
+            if selected is None:
+                continue
+            for key in keys:
+                if key != selected:
+                    observations.pop(key, None)
+                    logger.debug('Plex duplicate handoff session=%r suppressed in favor of session=%r '
+                                 'account=%r player=%r', key, selected, identity[0], identity[1])
+            for key in list(self.sessions):
+                tracked = self.sessions[key]
+                if self._device_identity(tracked.observation) == identity and key != selected:
+                    del self.sessions[key]
+                    logger.info('Session=%r superseded by Plex device handoff; reservation released immediately', key)
+
+    def _reconcile_theater_handoffs(self, observations):
+        active_ratings = {}
+        for obs in observations.values():
+            details = obs.theater_details
+            if details and obs.playback in ('playing', 'buffering'):
+                active_ratings.setdefault(details['room_id'], set()).add(obs.rating_key)
+        for room_id, ratings in active_ratings.items():
+            if len(ratings) != 1:
+                logger.warning('Theater room=%r reports multiple active rating keys=%r; retaining reservations',
+                               room_id, sorted(ratings))
+                continue
+            current_rating = next(iter(ratings))
+            for key in list(observations):
+                obs = observations[key]
+                details = obs.theater_details
+                if details and details['room_id'] == room_id and obs.rating_key != current_rating:
+                    observations.pop(key)
+            released = []
+            for key in list(self.sessions):
+                obs = self.sessions[key].observation
+                details = obs.theater_details
+                if details and details['room_id'] == room_id and obs.rating_key != current_rating:
+                    released.append((key, obs.rating_key))
+                    del self.sessions[key]
+            if released:
+                logger.info('Theater room handoff room=%r new_rating=%r released=%r; previous reservations released immediately',
+                            room_id, current_rating, released)
+
     def sync(self):
         if self.plex is None:
             self.plex = self._retry('Plex', self._open_plex, attempts=1)
@@ -284,6 +392,8 @@ class StateManager:
                 logger.info('Plex recovered after failures=%s; applying fresh snapshot', self.plex_failures)
             self.last_plex_success, self.last_plex_ok = now, True
             self.plex_failures, self.stale = 0, False
+            self._reconcile_theater_handoffs(observations)
+            self._reconcile_device_handoffs(observations)
             resumed = self._resumed_keys(observations, now)
             if self.theater:
                 owned = [entry['base'] for entry in self.theater.owned.values()]
@@ -377,6 +487,8 @@ class StateManager:
                         logger.error('Plex data stale age=%.1fs timeout=%ss; disabling alternative speeds; upload preference unchanged', age, self.cfg.plex_stale_seconds)
                     self.stale = True
                     self.sessions.clear()
+                    self.device_sessions.clear()
+                    self.retired_device_sessions.clear()
                 else:
                     for key in [k for k, s in self.sessions.items() if s.remaining(now) == 0]:
                         logger.info('Session=%r grace expired state=%s; released reservation', key, self.sessions[key].playback)

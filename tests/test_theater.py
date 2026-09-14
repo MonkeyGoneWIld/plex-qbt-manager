@@ -9,9 +9,9 @@ from theater import Theater, validate_snapshot, viewer_weight
 from test_controller import rig, xml_session
 
 
-def stream(sid='hls-1', viewers=1, state='playing', revision=1, age=0):
-    return dict(room_id='room', variant_id=sid, hls_session_id=sid,
-                plex_transcode_key=None, rating_key='42', state=state,
+def stream(sid='hls-1', viewers=1, state='playing', revision=1, age=0, rating='42', room='room'):
+    return dict(room_id=room, variant_id=sid, hls_session_id=sid,
+                plex_transcode_key=None, rating_key=rating, state=state,
                 state_revision=revision, state_age_seconds=age,
                 viewer_count=viewers, host_heartbeat_age_seconds=0)
 
@@ -21,8 +21,8 @@ def snapshot(*streams, server='server-1', instance='boot-1', sequence=1):
                 plex_server_id=server, delivery_mode='direct_p2p', streams=list(streams))
 
 
-def plex(sid='hls-1', key='1', bandwidth='12000', local='1', user='Bot'):
-    item = xml_session(key=key, bandwidth=bandwidth, local=local, user=user)
+def plex(sid='hls-1', key='1', bandwidth='12000', local='1', user='Bot', rating='42'):
+    item = xml_session(key=key, bandwidth=bandwidth, local=local, user=user, rating=rating)
     item.find('Session').set('id', sid)
     item.find('User').set('id', '7')
     return item
@@ -129,6 +129,27 @@ def test_late_snapshot_transfers_existing_ordinary_reservation(rig, monkeypatch)
     rig.poll(5, plex(local='0'))
     assert len(rig.m.sessions) == 1
     assert rig.m.status()['reserved_bandwidth_mbps'] == 19.2
+
+
+def test_episode_handoff_releases_old_room_variants_immediately(rig, monkeypatch):
+    t = enable(rig, monkeypatch, stream('old-a', viewers=3), stream('old-b', viewers=1))
+    rig.poll(0, plex('old-a', '10'), plex('old-b', '11'))
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 40.8
+
+    t.snapshot = snapshot(stream('new-a', viewers=4, revision=2, rating='43'), sequence=2)
+    t.received = 5
+    # Plex still exposes both old transcodes while the new episode starts.
+    rig.poll(5, plex('old-a', '10'), plex('old-b', '11'),
+             plex('new-a', '12', rating='43'))
+    assert set(rig.m.sessions) == {'theater:new-a'}
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 38.4
+    assert set(t.owned) == {'new-a'}
+
+
+def test_same_title_theater_variants_are_not_collapsed(rig, monkeypatch):
+    enable(rig, monkeypatch, stream('a', viewers=3), stream('b', viewers=2))
+    rig.poll(0, plex('a', '1'), plex('b', '2'))
+    assert set(rig.m.sessions) == {'theater:a', 'theater:b'}
 
 
 @pytest.mark.parametrize('server,streams', [('wrong-server', [stream()]), ('server-1', [stream('unmatched')])])
