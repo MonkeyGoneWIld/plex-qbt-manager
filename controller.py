@@ -264,11 +264,15 @@ class StateManager:
         return resumed
 
     @staticmethod
-    def _device_identity(obs):
-        if obs.theater_revision is not None or not obs.player_id:
+    def _account_device_identity(obs):
+        if not obs.player_id:
             return None
         account = obs.user_id or obs.user
         return (account, obs.player_id) if account else None
+
+    @classmethod
+    def _device_identity(cls, obs):
+        return None if obs.theater_revision is not None else cls._account_device_identity(obs)
 
     @staticmethod
     def _newest_session_key(keys):
@@ -366,6 +370,31 @@ class StateManager:
                 logger.info('Theater room handoff room=%r new_rating=%r released=%r; previous reservations released immediately',
                             room_id, current_rating, released)
 
+    def _suppress_pending_theater_handoffs(self, observations):
+        """Avoid a raw Plex duplicate while Theater's slower snapshot catches up."""
+        theater_by_device = {}
+        for obs in observations.values():
+            if obs.theater_revision is None or obs.playback not in ('playing', 'buffering'):
+                continue
+            identity = self._account_device_identity(obs)
+            if identity is not None:
+                theater_by_device.setdefault(identity, []).append(obs)
+        for key in list(observations):
+            obs = observations[key]
+            if obs.theater_revision is not None or obs.playback not in ('playing', 'buffering'):
+                continue
+            identity = self._account_device_identity(obs)
+            prior = [item for item in theater_by_device.get(identity, [])
+                     if item.rating_key != obs.rating_key]
+            if not prior:
+                continue
+            observations.pop(key)
+            self.sessions.pop(key, None)
+            logger.info('Plex session=%r rating=%r account=%r player=%r is awaiting Theater ownership; '
+                        'suppressed beside prior Theater rating=%r room=%r', key, obs.rating_key,
+                        identity[0], identity[1], prior[0].rating_key,
+                        prior[0].theater_details.get('room_id'))
+
     def sync(self):
         if self.plex is None:
             self.plex = self._retry('Plex', self._open_plex, attempts=1)
@@ -392,6 +421,7 @@ class StateManager:
                 logger.info('Plex recovered after failures=%s; applying fresh snapshot', self.plex_failures)
             self.last_plex_success, self.last_plex_ok = now, True
             self.plex_failures, self.stale = 0, False
+            self._suppress_pending_theater_handoffs(observations)
             self._reconcile_theater_handoffs(observations)
             self._reconcile_device_handoffs(observations)
             resumed = self._resumed_keys(observations, now)

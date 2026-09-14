@@ -136,6 +136,13 @@ def test_episode_handoff_releases_old_room_variants_immediately(rig, monkeypatch
     rig.poll(0, plex('old-a', '10'), plex('old-b', '11'))
     assert rig.m.status()['reserved_bandwidth_mbps'] == 40.8
 
+    # Plex exposes the replacement before Theater's next API poll. Keep the old
+    # weighted room reservation alone instead of adding the raw replacement.
+    rig.poll(4, plex('old-a', '10'), plex('old-b', '11'),
+             plex('new-a', '12', rating='43'))
+    assert set(rig.m.sessions) == {'theater:old-a', 'theater:old-b'}
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 40.8
+
     t.snapshot = snapshot(stream('new-a', viewers=4, revision=2, rating='43'), sequence=2)
     t.received = 5
     # Plex still exposes both old transcodes while the new episode starts.
