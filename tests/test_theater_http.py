@@ -66,3 +66,35 @@ def test_authenticated_http_poll_sequence_restart_and_failure_retention():
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_each_instance_polls_its_own_url_with_its_own_key():
+    calls = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            calls.append((self.path, self.headers.get('Authorization')))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps(snapshot(stream())).encode())
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f'http://127.0.0.1:{server.server_port}'
+        cfg = Config(theater_url=base + '/one', theater_api_key='key-one',
+                     theater_extra=[('2', base + '/two/', 'key-two')])
+        theaters = [Theater(cfg, Clock(), **instance) for instance in cfg.theaters]
+        for theater in theaters:
+            theater.poll()
+        assert calls == [('/one/api/integrations/qbt-manager/state', 'Bearer key-one'),
+                         ('/two/api/integrations/qbt-manager/state', 'Bearer key-two')]
+        assert all(theater.error is None and theater.received == 0 for theater in theaters)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()

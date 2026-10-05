@@ -18,6 +18,16 @@ from controller import StateManager, validate_config
 from waitress import serve
 
 
+def numbered_theaters(environ):
+    """THEATER_URL_<n>/THEATER_API_KEY_<n> pairs beyond THEATER_URL, as (n, url, key) in order."""
+    found = []
+    for name, url in environ.items():
+        match = re.fullmatch(r'THEATER_URL_([1-9][0-9]*)', name)
+        if match and url:
+            found.append((int(match.group(1)), url, environ.get(f'THEATER_API_KEY_{match.group(1)}', '')))
+    return [(str(number), url, key) for number, url, key in sorted(found)]
+
+
 @dataclass
 class Config:
     plex_url: str = field(default_factory=lambda: os.getenv('PLEX_URL', 'http://plex:32400'))
@@ -48,6 +58,9 @@ class Config:
     plex_stale_seconds: int = field(default_factory=lambda: os.getenv('PLEX_STALE_SECONDS', '120'))
     theater_url: str = field(default_factory=lambda: os.getenv('THEATER_URL', ''))
     theater_api_key: str = field(default_factory=lambda: os.getenv('THEATER_API_KEY', ''))
+    # Further instances: THEATER_URL_2/THEATER_API_KEY_2 and so on. The factor,
+    # poll, timeout and stale settings below are shared by every instance.
+    theater_extra: list = field(default_factory=lambda: numbered_theaters(os.environ))
     theater_bandwidth_factor: Decimal = field(default_factory=lambda: os.getenv('THEATER_BANDWIDTH_FACTOR', '1'))
     theater_poll_interval_seconds: int = field(default_factory=lambda: os.getenv('THEATER_POLL_INTERVAL_SECONDS', '5'))
     theater_timeout_seconds: int = field(default_factory=lambda: os.getenv('THEATER_TIMEOUT_SECONDS', '3'))
@@ -64,7 +77,7 @@ class RedactingFormatter(logging.Formatter):
     def __init__(self, cfg):
         super().__init__('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         self.secrets = set()
-        for secret in (cfg.plex_token, cfg.qbt_password, cfg.theater_api_key):
+        for secret in (cfg.plex_token, cfg.qbt_password, cfg.theater_api_key, *(key for _, _, key in cfg.theater_extra)):
             if secret:
                 self.secrets.update((secret, quote(secret, safe=''), quote_plus(secret)))
 
@@ -214,8 +227,9 @@ def main():
                 config.stop_delay_seconds, config.debounce_seconds, config.drift_check_seconds,
                 config.plex_stale_seconds, config.plex_timeout, config.qbt_timeout)
     state = StateManager(config)
-    logger.info('Theater integration enabled=%s factor=%s poll=%ss timeout=%ss stale=%ss; single-viewer factor=1',
-                bool(config.theater_url), config.theater_bandwidth_factor,
+    logger.info('Theater integration enabled=%s instances=%s factor=%s poll=%ss timeout=%ss stale=%ss; '
+                'single-viewer factor=1', bool(config.theaters), [theater['name'] for theater in config.theaters],
+                config.theater_bandwidth_factor,
                 config.theater_poll_interval_seconds, config.theater_timeout_seconds, config.theater_stale_seconds)
 
     def handle_signal(signum, _frame):

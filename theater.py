@@ -62,15 +62,36 @@ def validate_snapshot(value):
     return value
 
 
+def overlay_all(theaters, observations, server_id):
+    """Merge every instance's owned streams; a Plex row any instance claims is never counted raw."""
+    result, matched = {}, set()
+    for theater in theaters:
+        owned, claimed = theater.claim(observations, server_id)
+        if claimed & matched or owned.keys() & result.keys():
+            # Distinct Theaters never share a Plex session; this is one Theater behind two URLs.
+            theater.uncertain = True
+            logger.warning('Theater theater=%s claims Plex sessions owned by another instance; '
+                           'using minimum budget', theater.name)
+        result.update(owned)
+        matched |= claimed
+    for key, obs in observations.items():
+        if key not in matched and obs.remote:
+            result[key] = obs
+    return result
+
+
 class Theater:
-    def __init__(self, cfg, clock):
-        self.cfg, self.clock = cfg, clock
+    def __init__(self, cfg, clock, name='1', url=None, api_key=None):
+        self.cfg, self.clock, self.name = cfg, clock, name
+        self.url = cfg.theater_url if url is None else url
+        self.api_key = cfg.theater_api_key if api_key is None else api_key
         self.snapshot = None
         self.received = None
         self.attempted = float('-inf')
         self.error = None
         self.owned = {}
         self.uncertain = False
+        self.server_mismatch = False
 
     def poll(self):
         now = self.clock()
@@ -78,8 +99,8 @@ class Theater:
             return
         self.attempted = now
         try:
-            request = Request(self.cfg.theater_url.rstrip('/') + '/api/integrations/qbt-manager/state',
-                              headers={'Authorization': 'Bearer ' + self.cfg.theater_api_key,
+            request = Request(self.url.rstrip('/') + '/api/integrations/qbt-manager/state',
+                              headers={'Authorization': 'Bearer ' + self.api_key,
                                        'Accept': 'application/json'})
             # Disable redirects: never forward the integration credential elsewhere.
             from urllib.request import HTTPRedirectHandler, build_opener
@@ -95,21 +116,28 @@ class Theater:
                 if value['sequence'] <= self.snapshot['sequence']:
                     raise ValueError('Theater sequence did not advance')
             self.snapshot, self.received, self.error = value, self.clock(), None
-            logger.debug('Theater snapshot instance=%s sequence=%s variants=%s mode=%s',
-                         value['instance_id'], value['sequence'], len(value['streams']), value['delivery_mode'])
+            logger.debug('Theater snapshot theater=%s instance=%s sequence=%s variants=%s mode=%s',
+                         self.name, value['instance_id'], value['sequence'], len(value['streams']), value['delivery_mode'])
         except Exception as exc:
             self.error = type(exc).__name__
             # Do not print response bodies, URLs or headers containing credentials.
-            logger.warning('Theater snapshot failed error=%s last_success_age_seconds=%s; retaining last snapshot',
-                           self.error, round(self.clock() - self.received, 1) if self.received is not None else None)
+            logger.warning('Theater snapshot failed theater=%s error=%s last_success_age_seconds=%s; '
+                           'retaining last snapshot', self.name, self.error,
+                           round(self.clock() - self.received, 1) if self.received is not None else None)
 
-    def overlay(self, observations, server_id):
+    def claim(self, observations, server_id):
+        """Return this instance's owned observations and the raw Plex keys they replace."""
         now = self.clock()
         valid = self.snapshot and self.snapshot['plex_server_id'] == server_id
+        mismatch = bool(self.snapshot) and not valid
+        if mismatch and not self.server_mismatch:
+            logger.warning('Theater theater=%s reports Plex server=%r but PLEX_URL is server=%r; '
+                           'using minimum budget until they match', self.name, self.snapshot['plex_server_id'], server_id)
+        self.server_mismatch = mismatch
         fresh = valid and self.received is not None and now - self.received < self.cfg.theater_stale_seconds
         self.uncertain = not fresh
-        logger.debug('Theater freshness valid_server=%s age_seconds=%s stale_timeout=%s fresh=%s',
-                     bool(valid), now - self.received if self.received is not None else None,
+        logger.debug('Theater freshness theater=%s valid_server=%s age_seconds=%s stale_timeout=%s fresh=%s',
+                     self.name, bool(valid), now - self.received if self.received is not None else None,
                      self.cfg.theater_stale_seconds, bool(fresh))
         result = {}
         matched = set()
@@ -134,8 +162,8 @@ class Theater:
                            (o.session_id and o.session_id == sid) or
                            (base.transcode_key and o.transcode_key == base.transcode_key))
             del self.owned[sid]
-            logger.info('Theater ownership handoff room=%r old_session=%s old_rating=%r new_rating=%r; '
-                        'lingering Plex session suppressed', details.get('room_id'), sid,
+            logger.info('Theater ownership handoff theater=%s room=%r old_session=%s old_rating=%r new_rating=%r; '
+                        'lingering Plex session suppressed', self.name, details.get('room_id'), sid,
                         base.rating_key, next(iter(ratings)))
         present = set()
         for stream in streams:
@@ -163,12 +191,14 @@ class Theater:
                     equivalent_duplicates = True
                 else:
                     self.uncertain = True
-                    logger.warning('Theater ambiguous identity room=%s variant=%s sessions=%r; using minimum budget',
-                                   stream['room_id'], stream['variant_id'], [o.key for o in exact])
+                    logger.warning('Theater ambiguous identity theater=%s room=%s variant=%s sessions=%r; '
+                                   'using minimum budget', self.name, stream['room_id'], stream['variant_id'],
+                                   [o.key for o in exact])
                     continue
             if exact and exact[0].key in matched and not equivalent_duplicates:
                 self.uncertain = True
-                logger.warning('Theater ambiguous identity room=%s variant=%s; using minimum budget', stream['room_id'], stream['variant_id'])
+                logger.warning('Theater ambiguous identity theater=%s room=%s variant=%s; using minimum budget',
+                               self.name, stream['room_id'], stream['variant_id'])
                 continue
             old = self.owned.get(sid)
             base = exact[0] if exact else (old['base'] if old else None)
@@ -195,16 +225,16 @@ class Theater:
                 since = (old['zero_since'] if old['zero_since'] is not None else now) if old else now - self.cfg.stop_delay_seconds
             obs = replace(base, key='theater:' + sid, playback=state, bandwidth_kbps=bandwidth,
                           theater_revision=revision, state_since=since,
-                          theater_details={'room_id': stream['room_id'], 'variant_id': stream['variant_id'],
+                          theater_details={'instance': self.name, 'room_id': stream['room_id'], 'variant_id': stream['variant_id'],
                                            'viewer_count': stream['viewer_count'], 'weight': float(weight),
                                            'plex_user': base.user, 'plex_user_id': base.user_id,
                                            'plex_bandwidth_kbps': base.bandwidth_kbps,
                                            'delivery_mode': self.snapshot['delivery_mode']})
             self.owned[sid] = {'base': base, 'observation': obs, 'zero_since': since if not stream['viewer_count'] else None}
             result[obs.key] = obs
-            logger.debug('Theater session=%s user=%r user_id=%r variant=%s viewers=%s factor=%s weight=%s '
+            logger.debug('Theater theater=%s session=%s user=%r user_id=%r variant=%s viewers=%s factor=%s weight=%s '
                          'base_kbps=%s effective_kbps=%s state=%s revision=%s matched=%s',
-                         sid, base.user, base.user_id, stream['variant_id'], stream['viewer_count'],
+                         self.name, sid, base.user, base.user_id, stream['variant_id'], stream['viewer_count'],
                          self.cfg.theater_bandwidth_factor, weight, base.bandwidth_kbps, bandwidth, state, revision, bool(exact))
         # Retain stopped ownership while Plex keeps its transcode alive: never count it
         # again as an ordinary stream simply because Theater removed the room.
@@ -224,12 +254,9 @@ class Theater:
                     obs = replace(obs, playback='stopped', state_since=now)
                     old['observation'] = obs
             result[obs.key] = obs
-        for key, obs in observations.items():
-            if key not in matched and obs.remote:
-                result[key] = obs
-        return result
+        return result, matched
 
     def status(self):
-        return {'enabled': True, 'last_success_age_seconds': self.clock() - self.received if self.received is not None else None,
-                'error': self.error, 'uncertain': self.uncertain, 'owned_sessions': len(self.owned),
-                'bandwidth_factor': float(self.cfg.theater_bandwidth_factor)}
+        return {'name': self.name, 'last_success_age_seconds': self.clock() - self.received if self.received is not None else None,
+                'error': self.error, 'uncertain': self.uncertain, 'plex_server_mismatch': self.server_mismatch,
+                'owned_sessions': len(self.owned)}

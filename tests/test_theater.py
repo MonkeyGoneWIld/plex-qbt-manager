@@ -3,8 +3,8 @@ from decimal import Decimal
 
 import pytest
 
-from app import Config
-from controller import qbt_budget, upload_budget
+from app import Config, RedactingFormatter, numbered_theaters
+from controller import StateManager, qbt_budget, upload_budget
 from theater import Theater, validate_snapshot, viewer_weight
 from test_controller import rig, xml_session
 
@@ -30,11 +30,20 @@ def plex(sid='hls-1', key='1', bandwidth='12000', local='1', user='Bot', rating=
 
 def enable(rig, monkeypatch, *streams):
     rig.m.cfg.theater_bandwidth_factor = Decimal('0.8')
-    rig.m.theater = Theater(rig.m.cfg, rig.clock)
-    t = rig.m.theater
+    rig.m.theaters = [Theater(rig.m.cfg, rig.clock)]
+    t = rig.m.theaters[0]
     t.snapshot = snapshot(*streams)
     t.received = rig.clock()
     monkeypatch.setattr(t, 'poll', lambda: None)
+    return t
+
+
+def add_theater(rig, monkeypatch, name, *streams, **kwargs):
+    t = Theater(rig.m.cfg, rig.clock, name=name)
+    t.snapshot = snapshot(*streams, **kwargs)
+    t.received = rig.clock()
+    monkeypatch.setattr(t, 'poll', lambda: None)
+    rig.m.theaters.append(t)
     return t
 
 
@@ -158,7 +167,7 @@ def test_equivalent_duplicate_plex_rows_collapse_to_one_theater_stream(rig, monk
     rig.poll(0, plex('shared', '10'), plex('shared', '11', bandwidth='13000'))
     assert set(rig.m.sessions) == {'theater:shared'}
     assert rig.m.status()['reserved_bandwidth_mbps'] == 20.8
-    assert not rig.m.theater.uncertain
+    assert not rig.m.theaters[0].uncertain
 
 
 def test_unmatched_same_device_row_is_suppressed_beside_theater(rig, monkeypatch):
@@ -193,7 +202,7 @@ def test_duplicate_rows_during_episode_handoff_never_force_minimum(rig, monkeypa
     rig.poll(1, plex('old', '10', rating='42'),
              plex('new', '11', rating='43'), plex('new', '12', rating='43'))
     assert set(rig.m.sessions) == {'theater:old'}
-    assert not rig.m.theater.uncertain
+    assert not rig.m.theaters[0].uncertain
 
     # Theater catches up while both equivalent new rows still exist.
     t.snapshot = snapshot(stream('new', viewers=2, revision=2, rating='43'), sequence=2)
@@ -202,7 +211,7 @@ def test_duplicate_rows_during_episode_handoff_never_force_minimum(rig, monkeypa
              plex('new', '11', rating='43'), plex('new', '12', rating='43'))
     assert set(rig.m.sessions) == {'theater:new'}
     assert rig.m.status()['reserved_bandwidth_mbps'] == 19.2
-    assert not rig.m.theater.uncertain
+    assert not rig.m.theaters[0].uncertain
     assert rig.q.prefs['alt_up_limit'] != rig.m.cfg.min_upload_bps
 
 
@@ -212,8 +221,83 @@ def test_unmatched_or_foreign_snapshot_never_exempts_account(rig, monkeypatch, s
     t.snapshot = snapshot(*streams, server=server)
     rig.poll(0, plex(local='0'))
     assert '1' in rig.m.sessions
-    assert rig.m.theater.uncertain
+    assert rig.m.theaters[0].uncertain
     assert rig.q.prefs['alt_up_limit'] == rig.m.cfg.min_upload_bps
+    assert rig.m.status()['theater']['instances'][0]['plex_server_mismatch'] == (server == 'wrong-server')
+
+
+def test_two_instances_each_count_their_own_viewers(rig, monkeypatch):
+    enable(rig, monkeypatch, stream('a', 3))
+    add_theater(rig, monkeypatch, '2', stream('b', 2, room='other'), instance='boot-2')
+    rig.poll(0, plex('a', '1'), plex('b', '2', player='player-2'),
+             plex('ordinary', '3', bandwidth='5000', local='0', player='other-player'))
+    # 12*3*.8 from instance 1 + 12*2*.8 from instance 2 + ordinary 5 = 53 Mbps.
+    status = rig.m.status()
+    assert status['reserved_bandwidth_mbps'] == 53
+    assert set(rig.m.sessions) == {'theater:a', 'theater:b', '3'}
+    assert status['sessions']['theater:b']['theater']['instance'] == '2'
+    assert [i['name'] for i in status['theater']['instances']] == ['1', '2']
+    assert rig.q.prefs['alt_up_limit'] == qbt_budget(rig.m.cfg, upload_budget(rig.m.cfg, 53000))
+
+
+def test_same_room_id_in_two_instances_is_not_one_room(rig, monkeypatch):
+    t1 = enable(rig, monkeypatch, stream('a', 2))
+    t2 = add_theater(rig, monkeypatch, '2', stream('b', 2), instance='boot-2')
+    rig.poll(0, plex('a', '1'), plex('b', '2', player='player-2'))
+    # Instance 2 pauses while instance 1 keeps playing under the same room id.
+    t2.snapshot = snapshot(stream('b', 2, state='paused', revision=2), instance='boot-2', sequence=2)
+    t1.received = t2.received = 5
+    rig.poll(5, plex('a', '1'), plex('b', '2', player='player-2'))
+    assert set(rig.m.sessions) == {'theater:a', 'theater:b'}
+    assert rig.m.status()['sessions']['theater:b']['state'] == 'paused'
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 38.4
+
+
+def test_one_stale_instance_uses_minimum_budget(rig, monkeypatch):
+    t1 = enable(rig, monkeypatch, stream('a', 2))
+    add_theater(rig, monkeypatch, '2', instance='boot-2')
+    rig.poll(0, plex('a', '1'))
+    assert rig.q.prefs['alt_up_limit'] != rig.m.cfg.min_upload_bps
+    t1.received = 30
+    rig.poll(30, plex('a', '1'))
+    assert rig.q.prefs['alt_up_limit'] == rig.m.cfg.min_upload_bps
+    assert [i['uncertain'] for i in rig.m.status()['theater']['instances']] == [False, True]
+
+
+def test_one_theater_behind_two_urls_uses_minimum_budget(rig, monkeypatch):
+    enable(rig, monkeypatch, stream('a', 2))
+    add_theater(rig, monkeypatch, '2', stream('a', 2))
+    rig.poll(0, plex('a', '1'))
+    assert rig.m.theaters[1].uncertain
+    assert rig.q.prefs['alt_up_limit'] == rig.m.cfg.min_upload_bps
+
+
+def test_numbered_theater_instances_from_environment(monkeypatch):
+    env = {'THEATER_URL_3': 'http://three:3000', 'THEATER_API_KEY_3': 'key-3',
+           'THEATER_URL_2': 'http://two:3000', 'THEATER_API_KEY_2': 'key-2', 'THEATER_URL_4': ''}
+    assert numbered_theaters(env) == [('2', 'http://two:3000', 'key-2'), ('3', 'http://three:3000', 'key-3')]
+    cfg = Config(theater_url='http://one:3000', theater_api_key='key-1', theater_extra=numbered_theaters(env))
+    assert [tuple(t.values()) for t in cfg.theaters] == [
+        ('1', 'http://one:3000', 'key-1'), ('2', 'http://two:3000', 'key-2'), ('3', 'http://three:3000', 'key-3')]
+    assert {'key-1', 'key-2', 'key-3'} <= RedactingFormatter(cfg).secrets
+    monkeypatch.setattr(StateManager, '_connect', lambda self: None)
+    manager = StateManager(cfg)
+    assert [(t.name, t.url, t.api_key) for t in manager.theaters] == [tuple(t.values()) for t in cfg.theaters]
+
+
+def test_second_instance_alone_is_enough():
+    cfg = Config(theater_extra=[('2', 'http://two:3000', 'key-2')])
+    assert [t['name'] for t in cfg.theaters] == ['2']
+
+
+@pytest.mark.parametrize('extra,message', [
+    ([('2', 'http://two:3000', '')], 'THEATER_API_KEY_2 is required'),
+    ([('2', 'ftp://two', 'key')], 'THEATER_URL_2 must be'),
+    ([('2', 'http://ONE:3000/', 'key')], 'THEATER_URL_2 repeats'),
+    ([('1', 'http://two:3000', 'key')], 'THEATER_URL_2')])
+def test_numbered_theater_validation(extra, message):
+    with pytest.raises(ValueError, match=message):
+        Config(theater_url='http://one:3000', theater_api_key='key-1', theater_extra=extra)
 
 
 def test_theater_outage_protects_but_plex_outage_disables(rig, monkeypatch):

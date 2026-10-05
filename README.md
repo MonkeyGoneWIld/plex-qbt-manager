@@ -17,7 +17,7 @@ when streaming stops, qBittorrent returns to its normal speed settings.
 - Supports multiple Plex streams without double counting session handoffs.
 - Integrates with
   [Plex Discord Theater](https://github.com/MonkeyGoneWIld/plex-discord-theater)
-  for viewer-aware bandwidth estimates.
+  for viewer-aware bandwidth estimates, including several Theater instances at once.
 - Runs as a lightweight Docker container on AMD64 and ARM64.
 
 No Tautulli, Tracearr, browser extension, or additional Plex account is needed.
@@ -155,6 +155,30 @@ streams are added together.
 | `THEATER_POLL_INTERVAL_SECONDS` | `5` | Minimum seconds between Theater API checks. |
 | `THEATER_TIMEOUT_SECONDS` | `3` | Timeout for a Theater API request. |
 | `THEATER_STALE_SECONDS` | `30` | Maximum age of Theater data before it is treated as stale. |
+| `THEATER_URL_2`, `THEATER_API_KEY_2`, ... | Empty | Additional Theater instances. See below. |
+
+### Multiple Theater instances
+
+To include more than one Theater, give each extra instance a numbered URL and
+key. Set each Theater's `QBT_MANAGER_API_KEY` to the manager key with the same
+number:
+
+```yaml
+    environment:
+      THEATER_URL: "http://theater-one:3000"
+      THEATER_API_KEY: "secret-shared-with-theater-one"
+      THEATER_URL_2: "http://theater-two:3000"
+      THEATER_API_KEY_2: "secret-shared-with-theater-two"
+```
+
+Continue with `THEATER_URL_3` and `THEATER_API_KEY_3` for a third instance.
+`THEATER_BANDWIDTH_FACTOR` and the poll, timeout and stale settings apply to
+every instance.
+
+Every instance must use the same Plex server as `PLEX_URL`. The manager uses
+`MIN_UPLOAD_MIB` while any configured instance is unreachable, has stale data, or
+reports a different Plex server, because it cannot tell how many viewers that
+instance has. `GET /status` lists each instance under `theater.instances`.
 
 ## Optional Plex webhook
 

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from urllib.parse import urlsplit
-from theater import Theater
+from theater import Theater, overlay_all
 
 from plexapi.server import PlexServer
 from qbittorrentapi import Client as QBittorrentClient
@@ -51,12 +51,23 @@ def validate_config(cfg):
         if value <= 0:
             raise ValueError(f'{name.upper()} must be greater than zero')
         setattr(cfg, name, value)
-    if cfg.theater_url:
-        url = urlsplit(cfg.theater_url)
+    if any(name == '1' for name, _, _ in cfg.theater_extra):
+        raise ValueError('Set the first Theater with THEATER_URL; numbered instances start at THEATER_URL_2')
+    cfg.theaters, endpoints = [], set()
+    for name, theater_url, api_key in [('1', cfg.theater_url, cfg.theater_api_key), *cfg.theater_extra]:
+        if not theater_url:
+            continue
+        suffix = '' if name == '1' else '_' + name
+        url = urlsplit(theater_url)
         if url.scheme not in ('http', 'https') or not url.hostname or url.username or url.password or url.query or url.fragment:
-            raise ValueError('THEATER_URL must be an HTTP(S) URL without credentials, query or fragment')
-        if not cfg.theater_api_key or '\n' in cfg.theater_api_key or '\r' in cfg.theater_api_key:
-            raise ValueError('THEATER_API_KEY is required when THEATER_URL is set')
+            raise ValueError(f'THEATER_URL{suffix} must be an HTTP(S) URL without credentials, query or fragment')
+        if not api_key or '\n' in api_key or '\r' in api_key:
+            raise ValueError(f'THEATER_API_KEY{suffix} is required when THEATER_URL{suffix} is set')
+        endpoint = (url.scheme, url.hostname, url.port, url.path.rstrip('/'))
+        if endpoint in endpoints:
+            raise ValueError(f'THEATER_URL{suffix} repeats another Theater instance')
+        endpoints.add(endpoint)
+        cfg.theaters.append({'name': name, 'url': theater_url, 'api_key': api_key})
     if cfg.min_upload_mib > cfg.max_upload_mib:
         raise ValueError('MIN_UPLOAD_MIB must not exceed MAX_UPLOAD_MIB')
     cfg.min_upload_bps = int((cfg.min_upload_mib * MIB).to_integral_value(rounding=ROUND_CEILING))
@@ -188,7 +199,7 @@ class StateManager:
         self.retry_qbt = True
         self.last_decision = None
         self.cycle = 0
-        self.theater = Theater(cfg, clock) if cfg.theater_url else None
+        self.theaters = [Theater(cfg, clock, **instance) for instance in cfg.theaters]
         # Plex may briefly expose both sides of a player handoff. Remember which
         # session belongs to each account/device so the old item cannot consume
         # bandwidth for its full stop grace after the next item has started.
@@ -349,32 +360,34 @@ class StateManager:
         for obs in observations.values():
             details = obs.theater_details
             if details and obs.playback in ('playing', 'buffering'):
-                active_ratings.setdefault(details['room_id'], set()).add(obs.rating_key)
-                active_sessions.setdefault(details['room_id'], set()).add(obs.key)
-        for room_id, ratings in active_ratings.items():
+                # Room ids are only unique within one Theater instance.
+                room = (details['instance'], details['room_id'])
+                active_ratings.setdefault(room, set()).add(obs.rating_key)
+                active_sessions.setdefault(room, set()).add(obs.key)
+        for room, ratings in active_ratings.items():
             if len(ratings) != 1:
-                logger.warning('Theater room=%r reports multiple active rating keys=%r; retaining reservations',
-                               room_id, sorted(ratings))
+                logger.warning('Theater theater=%s room=%r reports multiple active rating keys=%r; retaining reservations',
+                               room[0], room[1], sorted(ratings))
                 continue
             current_rating = next(iter(ratings))
-            current_sessions = active_sessions[room_id]
+            current_sessions = active_sessions[room]
             for key in list(observations):
                 obs = observations[key]
                 details = obs.theater_details
-                if (details and details['room_id'] == room_id and
+                if (details and (details['instance'], details['room_id']) == room and
                         (obs.rating_key != current_rating or key not in current_sessions)):
                     observations.pop(key)
             released = []
             for key in list(self.sessions):
                 obs = self.sessions[key].observation
                 details = obs.theater_details
-                if (details and details['room_id'] == room_id and
+                if (details and (details['instance'], details['room_id']) == room and
                         (obs.rating_key != current_rating or key not in current_sessions)):
                     released.append((key, obs.rating_key))
                     del self.sessions[key]
             if released:
-                logger.info('Theater room handoff room=%r new_rating=%r released=%r; previous reservations released immediately',
-                            room_id, current_rating, released)
+                logger.info('Theater room handoff theater=%s room=%r new_rating=%r released=%r; '
+                            'previous reservations released immediately', room[0], room[1], current_rating, released)
 
     def _suppress_pending_theater_handoffs(self, observations):
         """Keep unmatched Plex rows for a Theater device out of the budget."""
@@ -418,7 +431,7 @@ class StateManager:
         try:
             if self.plex is None:
                 raise ConnectionError('Plex unavailable')
-            observations = read_observations(self.plex.query('/status/sessions'), include_local=self.theater is not None)
+            observations = read_observations(self.plex.query('/status/sessions'), include_local=bool(self.theaters))
         except Exception as exc:
             with self.lock:
                 self.last_plex_ok = False
@@ -429,9 +442,10 @@ class StateManager:
                 self.plex = None
             return False
         now = self.clock()
-        if self.theater:
-            self.theater.poll()
-            observations = self.theater.overlay(observations, str(getattr(self.plex, 'machineIdentifier', '')))
+        if self.theaters:
+            for theater in self.theaters:
+                theater.poll()
+            observations = overlay_all(self.theaters, observations, str(getattr(self.plex, 'machineIdentifier', '')))
             now = self.clock()
         with self.lock:
             if self.plex_failures or self.stale:
@@ -442,8 +456,8 @@ class StateManager:
             self._reconcile_theater_handoffs(observations)
             self._reconcile_device_handoffs(observations)
             resumed = self._resumed_keys(observations, now)
-            if self.theater:
-                owned = [entry['base'] for entry in self.theater.owned.values()]
+            if self.theaters:
+                owned = [entry['base'] for theater in self.theaters for entry in theater.owned.values()]
                 for key in list(self.sessions):
                     obs = self.sessions[key].observation
                     if obs.theater_revision is None and any(
@@ -542,7 +556,7 @@ class StateManager:
                         logger.info('Session=%r grace expired state=%s; released reservation', key, self.sessions[key].playback)
                         del self.sessions[key]
                 total = sum(s.bandwidth_kbps or 0 for s in self.sessions.values())
-                unknown = any(s.bandwidth_kbps is None for s in self.sessions.values()) or bool(self.theater and self.theater.uncertain)
+                unknown = any(s.bandwidth_kbps is None for s in self.sessions.values()) or any(theater.uncertain for theater in self.theaters)
                 want = not self.stale and (bool(self.sessions) or unknown)
                 calculated = upload_budget(self.cfg, total, unknown) if want and self.cfg.dynamic_upload_enabled else None
                 limit = qbt_budget(self.cfg, calculated) if calculated is not None else None
@@ -637,7 +651,10 @@ class StateManager:
                 'desired_alt_speeds_enabled': self.desired_mode,
                 'dynamic_upload_enabled': self.cfg.dynamic_upload_enabled,
                 'reserved_bandwidth_mbps': float(sum(s.bandwidth_kbps or 0 for s in self.sessions.values()) / 1000),
-                'theater': self.theater.status() if self.theater else {'enabled': False},
+                'theater': {'enabled': True, 'uncertain': any(theater.uncertain for theater in self.theaters),
+                            'bandwidth_factor': float(self.cfg.theater_bandwidth_factor),
+                            'instances': [theater.status() for theater in self.theaters]}
+                           if self.theaters else {'enabled': False},
                 'unknown_bandwidth_sessions': sum(s.bandwidth_kbps is None for s in self.sessions.values()),
                 'min_upload_mib': float(self.cfg.min_upload_mib), 'max_upload_mib': float(self.cfg.max_upload_mib),
                 'bandwidth_multiplier': float(self.cfg.bandwidth_multiplier),
