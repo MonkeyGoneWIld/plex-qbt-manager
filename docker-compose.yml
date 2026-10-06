@@ -1,6 +1,6 @@
 services:
   plex-qbt-manager:
-    image: ghcr.io/monkeygonewild/plex-qbt-manager:latest
+    image: ghcr.io/monkeygonewild/plex-qbt-manager:1.2.0
     container_name: plex-qbt-manager
     restart: unless-stopped
     ports:

@@ -30,7 +30,7 @@ Create a `compose.yml` file:
 ```yaml
 services:
   plex-qbt-manager:
-    image: ghcr.io/monkeygonewild/plex-qbt-manager:1.0.1
+    image: ghcr.io/monkeygonewild/plex-qbt-manager:1.2.0
     container_name: plex-qbt-manager
     restart: unless-stopped
     ports:
@@ -219,7 +219,7 @@ Useful endpoints:
 
 Released images are available from the
 [GitHub Container Registry package](https://github.com/MonkeyGoneWIld/plex-qbt-manager/pkgs/container/plex-qbt-manager)
-as `latest`, `1.0.1`, and `1.0`.
+as `latest`, `1.2.0`, and `1.2`.
 
 ## License
 
