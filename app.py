@@ -64,7 +64,7 @@ class Config:
     theater_bandwidth_factor: Decimal = field(default_factory=lambda: os.getenv('THEATER_BANDWIDTH_FACTOR', '1'))
     theater_poll_interval_seconds: int = field(default_factory=lambda: os.getenv('THEATER_POLL_INTERVAL_SECONDS', '5'))
     theater_timeout_seconds: int = field(default_factory=lambda: os.getenv('THEATER_TIMEOUT_SECONDS', '3'))
-    theater_stale_seconds: int = field(default_factory=lambda: os.getenv('THEATER_STALE_SECONDS', '120'))
+    theater_stale_seconds: int = field(default_factory=lambda: os.getenv('THEATER_STALE_SECONDS', '30'))
 
     def __post_init__(self):
         validate_config(self)

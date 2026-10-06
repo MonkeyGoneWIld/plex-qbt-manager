@@ -259,11 +259,11 @@ def test_unreachable_instance_is_ignored_while_other_keeps_counting(rig, monkeyp
     rows = (plex('a', '1'), plex('b', '2', player='player-2'))
     rig.poll(0, *rows)
     assert rig.m.status()['reserved_bandwidth_mbps'] == 48
-    t1.received = 119
-    rig.poll(119, *rows)
+    t1.received = 29
+    rig.poll(29, *rows)
     assert rig.m.status()['reserved_bandwidth_mbps'] == 48
-    t1.received = 120
-    rig.poll(120, *rows)
+    t1.received = 30
+    rig.poll(30, *rows)
     assert set(rig.m.sessions) == {'theater:a'}
     assert rig.m.status()['reserved_bandwidth_mbps'] == 19.2
     assert [i['ignored'] for i in rig.m.status()['theater']['instances']] == [False, True]
@@ -312,16 +312,16 @@ def test_theater_outage_holds_reservation_then_ignores_instance(rig, monkeypatch
     rig.poll(0, plex())
     limit = rig.q.prefs['alt_up_limit']
     # Theater stops answering: its last snapshot keeps the 19.2 Mbps reservation.
-    rig.poll(119, plex())
+    rig.poll(29, plex())
     assert rig.m.status()['reserved_bandwidth_mbps'] == 19.2
     assert rig.q.mode and rig.q.prefs['alt_up_limit'] == limit and not t.uncertain
     # After the timeout it is ignored; its local Plex row is not counted on its own.
-    rig.poll(120, plex())
+    rig.poll(30, plex())
     assert not rig.m.sessions and not rig.q.mode
     assert rig.m.status()['theater']['instances'][0]['ignored']
     t.snapshot = snapshot(stream(viewers=2, revision=2), sequence=2)
-    t.received = 130
-    rig.poll(130, plex())
+    t.received = 35
+    rig.poll(35, plex())
     assert rig.m.status()['reserved_bandwidth_mbps'] == 19.2 and rig.q.mode
     assert not rig.m.status()['theater']['instances'][0]['ignored']
 

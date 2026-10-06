@@ -134,7 +134,7 @@ variables to the manager service:
       THEATER_BANDWIDTH_FACTOR: "0.85"
       THEATER_POLL_INTERVAL_SECONDS: "5"
       THEATER_TIMEOUT_SECONDS: "3"
-      THEATER_STALE_SECONDS: "120"
+      THEATER_STALE_SECONDS: "30"
 ```
 
 The services must be able to reach each other. For one viewer, the Plex bandwidth
@@ -154,7 +154,7 @@ streams are added together.
 | `THEATER_BANDWIDTH_FACTOR` | `1` | Per-viewer estimate used when a variant has at least two viewers. |
 | `THEATER_POLL_INTERVAL_SECONDS` | `5` | Minimum seconds between Theater API checks. |
 | `THEATER_TIMEOUT_SECONDS` | `3` | Timeout for a Theater API request. |
-| `THEATER_STALE_SECONDS` | `120` | Seconds an unreachable Theater's last data keeps counting. After that, the instance is ignored until it answers again. |
+| `THEATER_STALE_SECONDS` | `30` | Seconds an unreachable Theater's last data keeps counting. After that, the instance is ignored until it answers again. |
 | `THEATER_URL_2`, `THEATER_API_KEY_2`, ... | Empty | Additional Theater instances. See below. |
 
 ### Multiple Theater instances
