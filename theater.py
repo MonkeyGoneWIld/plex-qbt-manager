@@ -92,6 +92,7 @@ class Theater:
         self.owned = {}
         self.uncertain = False
         self.server_mismatch = False
+        self.ignored = False
 
     def poll(self):
         now = self.clock()
@@ -121,26 +122,37 @@ class Theater:
         except Exception as exc:
             self.error = type(exc).__name__
             # Do not print response bodies, URLs or headers containing credentials.
-            logger.warning('Theater snapshot failed theater=%s error=%s last_success_age_seconds=%s; '
-                           'retaining last snapshot', self.name, self.error,
-                           round(self.clock() - self.received, 1) if self.received is not None else None)
+            log = logger.debug if self.ignored else logger.warning
+            log('Theater snapshot failed theater=%s error=%s last_success_age_seconds=%s; retaining last snapshot',
+                self.name, self.error, round(self.clock() - self.received, 1) if self.received is not None else None)
 
     def claim(self, observations, server_id):
         """Return this instance's owned observations and the raw Plex keys they replace."""
         now = self.clock()
-        valid = self.snapshot and self.snapshot['plex_server_id'] == server_id
-        mismatch = bool(self.snapshot) and not valid
-        if mismatch and not self.server_mismatch:
+        age = now - self.received if self.received is not None else None
+        logger.debug('Theater freshness theater=%s age_seconds=%s stale_timeout=%s',
+                     self.name, age, self.cfg.theater_stale_seconds)
+        if age is None or age >= self.cfg.theater_stale_seconds:
+            # Until the timeout the last snapshot keeps counting. After it, nothing is likely
+            # playing on a Theater nobody can reach, so act as if it were not configured.
+            if not self.ignored:
+                logger.warning('Theater theater=%s unanswered last_success_age_seconds=%s stale_timeout=%ss; '
+                               'ignoring it until it answers', self.name,
+                               round(age, 1) if age is not None else None, self.cfg.theater_stale_seconds)
+            self.ignored, self.uncertain = True, False
+            self.owned.clear()
+            return {}, set()
+        if self.ignored:
+            logger.info('Theater theater=%s answering again; counting its streams', self.name)
+            self.ignored = False
+        valid = self.snapshot['plex_server_id'] == server_id
+        if not valid and not self.server_mismatch:
             logger.warning('Theater theater=%s reports Plex server=%r but PLEX_URL is server=%r; '
                            'using minimum budget until they match', self.name, self.snapshot['plex_server_id'], server_id)
-        self.server_mismatch = mismatch
-        fresh = valid and self.received is not None and now - self.received < self.cfg.theater_stale_seconds
-        self.uncertain = not fresh
-        logger.debug('Theater freshness theater=%s valid_server=%s age_seconds=%s stale_timeout=%s fresh=%s',
-                     self.name, bool(valid), now - self.received if self.received is not None else None,
-                     self.cfg.theater_stale_seconds, bool(fresh))
+        self.server_mismatch = self.uncertain = not valid
         result = {}
         matched = set()
+        handed_off = {}
         streams = self.snapshot['streams'] if valid else []
         # A Theater room can have several audio/subtitle variants for one title.
         # When its rating key changes, the old Plex transcodes can linger briefly;
@@ -162,6 +174,7 @@ class Theater:
                            (o.session_id and o.session_id == sid) or
                            (base.transcode_key and o.transcode_key == base.transcode_key))
             del self.owned[sid]
+            handed_off.setdefault(details.get('room_id'), base)
             logger.info('Theater ownership handoff theater=%s room=%r old_session=%s old_rating=%r new_rating=%r; '
                         'lingering Plex session suppressed', self.name, details.get('room_id'), sid,
                         base.rating_key, next(iter(ratings)))
@@ -202,6 +215,13 @@ class Theater:
                 continue
             old = self.owned.get(sid)
             base = exact[0] if exact else (old['base'] if old else None)
+            if base is None and stream['room_id'] in handed_off:
+                # Plex lists a replacement transcode a poll or two after Theater announces it.
+                # Bridge that gap with the stream it replaced rather than the minimum budget.
+                base = replace(handed_off[stream['room_id']], session_id=sid, transcode_key='',
+                               rating_key=stream['rating_key'])
+                logger.info('Theater theater=%s session=%s not yet listed by Plex; using replaced stream '
+                            'bandwidth_kbps=%s', self.name, sid, base.bandwidth_kbps)
             if base and base.bandwidth_kbps is None and old:
                 base = replace(base, bandwidth_kbps=old['base'].bandwidth_kbps)
             if exact:
@@ -249,7 +269,7 @@ class Theater:
                 continue
             matched.update(o.key for o in exact)
             obs = old['observation']
-            if fresh:
+            if valid:
                 if obs.playback != 'stopped':
                     obs = replace(obs, playback='stopped', state_since=now)
                     old['observation'] = obs
@@ -258,5 +278,6 @@ class Theater:
 
     def status(self):
         return {'name': self.name, 'last_success_age_seconds': self.clock() - self.received if self.received is not None else None,
-                'error': self.error, 'uncertain': self.uncertain, 'plex_server_mismatch': self.server_mismatch,
+                'error': self.error, 'ignored': self.ignored, 'uncertain': self.uncertain,
+                'plex_server_mismatch': self.server_mismatch,
                 'owned_sessions': len(self.owned)}

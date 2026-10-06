@@ -228,7 +228,10 @@ class StateManager:
     def _open_qbt(self):
         qbt = QBittorrentClient(host=self.cfg.qbt_url, username=self.cfg.qbt_username,
                                password=self.cfg.qbt_password,
-                               REQUESTS_ARGS={'timeout': (3.05, self.cfg.qbt_timeout)})
+                               REQUESTS_ARGS={'timeout': (3.05, self.cfg.qbt_timeout)},
+                               # A reused idle connection can be dropped silently on the way to
+                               # qBittorrent, stalling a request for the whole read timeout.
+                               EXTRA_HEADERS={'Connection': 'close'})
         qbt.auth_log_in()
         logger.info('qBittorrent connected version=%s', qbt.app.version)
         return qbt
@@ -265,8 +268,9 @@ class StateManager:
             matches = [key for key, obs in observations.items()
                        if (obs.player_id, obs.rating_key, obs.user) == (hint.player_id, hint.rating_key, hint.user)]
             if len(matches) == 1:
+                if matches[0] not in resumed:
+                    logger.info('Session=%r matched resume webhook; previous grace timer cleared', matches[0])
                 resumed.add(matches[0])
-                logger.info('Session=%r matched resume webhook; previous grace timer cleared', matches[0])
             elif len(matches) > 1:
                 logger.warning('Ambiguous resume hint matches=%s; polling remains authoritative', len(matches))
             else:
@@ -457,10 +461,15 @@ class StateManager:
             self._reconcile_device_handoffs(observations)
             resumed = self._resumed_keys(observations, now)
             if self.theaters:
+                ignored = {theater.name for theater in self.theaters if theater.ignored}
                 owned = [entry['base'] for theater in self.theaters for entry in theater.owned.values()]
                 for key in list(self.sessions):
                     obs = self.sessions[key].observation
-                    if obs.theater_revision is None and any(
+                    if obs.theater_details and obs.theater_details['instance'] in ignored:
+                        del self.sessions[key]
+                        logger.info('Session=%r released because Theater theater=%s is ignored',
+                                    key, obs.theater_details['instance'])
+                    elif obs.theater_revision is None and any(
                             (obs.session_id and obs.session_id == base.session_id) or
                             (obs.transcode_key and obs.transcode_key == base.transcode_key) for base in owned):
                         del self.sessions[key]

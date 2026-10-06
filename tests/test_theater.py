@@ -253,15 +253,22 @@ def test_same_room_id_in_two_instances_is_not_one_room(rig, monkeypatch):
     assert rig.m.status()['reserved_bandwidth_mbps'] == 38.4
 
 
-def test_one_stale_instance_uses_minimum_budget(rig, monkeypatch):
+def test_unreachable_instance_is_ignored_while_other_keeps_counting(rig, monkeypatch):
     t1 = enable(rig, monkeypatch, stream('a', 2))
-    add_theater(rig, monkeypatch, '2', instance='boot-2')
-    rig.poll(0, plex('a', '1'))
-    assert rig.q.prefs['alt_up_limit'] != rig.m.cfg.min_upload_bps
-    t1.received = 30
-    rig.poll(30, plex('a', '1'))
-    assert rig.q.prefs['alt_up_limit'] == rig.m.cfg.min_upload_bps
-    assert [i['uncertain'] for i in rig.m.status()['theater']['instances']] == [False, True]
+    add_theater(rig, monkeypatch, '2', stream('b', 3, room='other'), instance='boot-2')
+    rows = (plex('a', '1'), plex('b', '2', player='player-2'))
+    rig.poll(0, *rows)
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 48
+    t1.received = 119
+    rig.poll(119, *rows)
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 48
+    t1.received = 120
+    rig.poll(120, *rows)
+    assert set(rig.m.sessions) == {'theater:a'}
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 19.2
+    assert [i['ignored'] for i in rig.m.status()['theater']['instances']] == [False, True]
+    assert not any(t.uncertain for t in rig.m.theaters)
+    assert rig.q.prefs['alt_up_limit'] == qbt_budget(rig.m.cfg, upload_budget(rig.m.cfg, 19200))
 
 
 def test_one_theater_behind_two_urls_uses_minimum_budget(rig, monkeypatch):
@@ -300,14 +307,65 @@ def test_numbered_theater_validation(extra, message):
         Config(theater_url='http://one:3000', theater_api_key='key-1', theater_extra=extra)
 
 
-def test_theater_outage_protects_but_plex_outage_disables(rig, monkeypatch):
+def test_theater_outage_holds_reservation_then_ignores_instance(rig, monkeypatch):
+    t = enable(rig, monkeypatch, stream(viewers=2))
+    rig.poll(0, plex())
+    limit = rig.q.prefs['alt_up_limit']
+    # Theater stops answering: its last snapshot keeps the 19.2 Mbps reservation.
+    rig.poll(119, plex())
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 19.2
+    assert rig.q.mode and rig.q.prefs['alt_up_limit'] == limit and not t.uncertain
+    # After the timeout it is ignored; its local Plex row is not counted on its own.
+    rig.poll(120, plex())
+    assert not rig.m.sessions and not rig.q.mode
+    assert rig.m.status()['theater']['instances'][0]['ignored']
+    t.snapshot = snapshot(stream(viewers=2, revision=2), sequence=2)
+    t.received = 130
+    rig.poll(130, plex())
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 19.2 and rig.q.mode
+    assert not rig.m.status()['theater']['instances'][0]['ignored']
+
+
+def test_never_reached_instance_is_ignored_not_minimum(rig, monkeypatch):
+    t = enable(rig, monkeypatch, stream(viewers=2))
+    t.snapshot = t.received = None
+    rig.poll(0, plex(), plex('remote', '2', bandwidth='5000', local='0', user='Friend', player='phone'))
+    assert set(rig.m.sessions) == {'2'} and not t.uncertain
+    assert rig.q.prefs['alt_up_limit'] == qbt_budget(rig.m.cfg, upload_budget(rig.m.cfg, 5000))
+
+
+def test_plex_outage_holds_theater_reservation_then_disables(rig, monkeypatch):
     enable(rig, monkeypatch, stream(viewers=2))
     rig.poll(0, plex())
-    rig.poll(30, plex())
-    assert rig.q.prefs['alt_up_limit'] == rig.m.cfg.min_upload_bps
+    limit = rig.q.prefs['alt_up_limit']
     rig.p.query.side_effect = TimeoutError()
-    rig.poll(150)
+    rig.poll(119)
+    assert rig.q.mode and rig.q.prefs['alt_up_limit'] == limit
+    rig.poll(120)
     assert not rig.q.mode
+
+
+def test_local_theater_rows_count_once_through_the_api(rig, monkeypatch):
+    enable(rig, monkeypatch, stream('a', 3))
+    rig.poll(0, plex('a', '1'), plex('not-in-a-room', '2', player='player-9'),
+             plex('lan-tv', '3', user='Home', player='tv'),
+             plex('remote', '4', bandwidth='5000', local='0', user='Friend', player='phone'))
+    # Theater's local row counts once at 12*3*.8; other LAN rows are free; remote rows count.
+    assert set(rig.m.sessions) == {'theater:a', '4'}
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 33.8
+
+
+def test_replacement_stream_not_yet_listed_by_plex_keeps_previous_bandwidth(rig, monkeypatch):
+    t = enable(rig, monkeypatch, stream('old', viewers=2))
+    rig.poll(0, plex('old', '10'))
+    t.snapshot = snapshot(stream('new', viewers=2, revision=2), sequence=2)
+    t.received = 5
+    rig.poll(5, plex('old', '10'))
+    assert set(rig.m.sessions) == {'theater:new'} and not t.uncertain
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 19.2
+    assert rig.q.prefs['alt_up_limit'] != rig.m.cfg.min_upload_bps
+    rig.poll(10, plex('new', '11', bandwidth='13000'))
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 20.8
 
 
 def test_plex_outage_freezes_even_pending_qbt_write_and_external_changes(rig):

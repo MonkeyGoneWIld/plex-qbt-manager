@@ -30,6 +30,8 @@ def api_server():
         def do_GET(self):
             path = urlsplit(self.path).path
             data.requests.append(('GET', path, dict(self.headers)))
+            if path.startswith('/api/v2/') and self.headers.get('Connection') == 'close':
+                self.close_connection = True
             if path == '/':
                 self.reply('<MediaContainer machineIdentifier="server-1" version="1.40.0" friendlyName="Test Plex"/>', 'application/xml')
             elif path == '/status/sessions':
@@ -92,6 +94,8 @@ def test_real_clients_use_token_and_bytes(api_server, multiplier, expected):
     assert data.mode == 1
     assert data.prefs == {'alt_up_limit': expected, 'alt_dl_limit': 2048, 'up_limit': 0}
     assert manager.qbt_ok and manager.last_plex_ok
+    qbt_reads = [headers for method, path, headers in data.requests if method == 'GET' and path.startswith('/api/v2/')]
+    assert qbt_reads and all(headers.get('Connection') == 'close' for headers in qbt_reads)
     session_requests = [headers for method, path, headers in data.requests if path == '/status/sessions']
     assert session_requests and session_requests[0]['X-Plex-Token'] == 'test-plex-token'
     writes = [body for method, path, body in data.requests if path == '/api/v2/app/setPreferences']

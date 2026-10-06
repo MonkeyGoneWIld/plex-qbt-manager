@@ -486,6 +486,14 @@ def test_stale_fallback_toggle_only_does_not_overwrite_preferences(rig):
     assert not rig.q.mode and rig.q.prefs['alt_up_limit'] == 1024
 
 
+def test_repeated_resume_hints_log_one_match(rig, caplog):
+    caplog.set_level(logging.INFO, logger='plex-qbt')
+    for _ in range(3):
+        rig.m.poke(hint())
+    rig.poll(0, xml_session())
+    assert caplog.text.count('matched resume webhook') == 1
+
+
 def test_duplicate_hints_in_one_cycle_do_not_extend_pause_forever(rig):
     rig.poll(0, xml_session())
     rig.poll(5, xml_session(state='paused'))

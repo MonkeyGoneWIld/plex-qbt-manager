@@ -12,8 +12,8 @@ when streaming stops, qBittorrent returns to its normal speed settings.
 - Adjusts the upload limit using bandwidth reported by Plex.
 - Supports minimum and maximum upload limits plus a safety multiplier.
 - Handles play, pause, buffering, stopping, and episode changes.
-- Keeps current settings through brief Plex outages and safely disables
-  alternative mode if Plex remains unavailable.
+- Keeps current settings through Plex outages of up to two minutes and then
+  disables alternative mode if Plex remains unavailable.
 - Supports multiple Plex streams without double counting session handoffs.
 - Integrates with
   [Plex Discord Theater](https://github.com/MonkeyGoneWIld/plex-discord-theater)
@@ -106,7 +106,7 @@ All settings are Docker environment variables.
 | `PLEX_TIMEOUT` | `10` | Timeout for a Plex request, in seconds. |
 | `QBITTORRENT_TIMEOUT` | `10` | Timeout for a qBittorrent request, in seconds. |
 | `DRIFT_CHECK_SECONDS` | `60` | Interval for detecting qBittorrent settings changed elsewhere. |
-| `PLEX_STALE_SECONDS` | `120` | Time without a successful Plex response before alternative mode is disabled. |
+| `PLEX_STALE_SECONDS` | `120` | Seconds without a successful Plex response before alternative mode is disabled. Until then, current qBittorrent settings are kept. |
 | `LOG_LEVEL` | `INFO` | Use `DEBUG` for session and calculation details. |
 | `HTTP_PORT` | `5252` | Manager HTTP port inside the container. |
 
@@ -134,7 +134,7 @@ variables to the manager service:
       THEATER_BANDWIDTH_FACTOR: "0.85"
       THEATER_POLL_INTERVAL_SECONDS: "5"
       THEATER_TIMEOUT_SECONDS: "3"
-      THEATER_STALE_SECONDS: "30"
+      THEATER_STALE_SECONDS: "120"
 ```
 
 The services must be able to reach each other. For one viewer, the Plex bandwidth
@@ -154,7 +154,7 @@ streams are added together.
 | `THEATER_BANDWIDTH_FACTOR` | `1` | Per-viewer estimate used when a variant has at least two viewers. |
 | `THEATER_POLL_INTERVAL_SECONDS` | `5` | Minimum seconds between Theater API checks. |
 | `THEATER_TIMEOUT_SECONDS` | `3` | Timeout for a Theater API request. |
-| `THEATER_STALE_SECONDS` | `30` | Maximum age of Theater data before it is treated as stale. |
+| `THEATER_STALE_SECONDS` | `120` | Seconds an unreachable Theater's last data keeps counting. After that, the instance is ignored until it answers again. |
 | `THEATER_URL_2`, `THEATER_API_KEY_2`, ... | Empty | Additional Theater instances. See below. |
 
 ### Multiple Theater instances
@@ -175,10 +175,17 @@ Continue with `THEATER_URL_3` and `THEATER_API_KEY_3` for a third instance.
 `THEATER_BANDWIDTH_FACTOR` and the poll, timeout and stale settings apply to
 every instance.
 
-Every instance must use the same Plex server as `PLEX_URL`. The manager uses
-`MIN_UPLOAD_MIB` while any configured instance is unreachable, has stale data, or
-reports a different Plex server, because it cannot tell how many viewers that
-instance has. `GET /status` lists each instance under `theater.instances`.
+Every instance must use the same Plex server as `PLEX_URL`. If an instance
+reports a different Plex server, the manager uses `MIN_UPLOAD_MIB` until that is
+fixed. `GET /status` lists each instance under `theater.instances`.
+
+### When a Theater is unreachable
+
+If a Theater stops answering, its last reported streams keep counting toward
+the upload budget for `THEATER_STALE_SECONDS`. After that, the manager ignores
+that instance: its reservations are released and its Plex sessions are not
+counted, as if it were not configured. It is counted again as soon as it
+answers. Other instances and ordinary Plex streams are unaffected.
 
 ## Optional Plex webhook
 
