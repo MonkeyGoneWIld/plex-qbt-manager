@@ -106,6 +106,8 @@ class Observation:
     theater_revision: tuple | None = None
     state_since: float | None = None
     theater_details: dict | None = None
+    # Plex's Session element, or Theater's snapshot for what its ffmpeg engine makes.
+    bandwidth_source: str = 'plex_session'
 
 
 def read_observations(root, include_local=False):
@@ -291,6 +293,16 @@ class StateManager:
         return None if obs.theater_revision is not None else cls._account_device_identity(obs)
 
     @staticmethod
+    def _identity_changed(old, new):
+        # Theater names an ffmpeg stream itself. Its reporter's Plex row only says whose
+        # account it plays under, and is often listed a poll after the stream starts. So is
+        # the transcode of a stream bridged from an ffmpeg one, which has no player until then.
+        if (new.theater_details or {}).get('engine') == 'ffmpeg' or (
+                new.theater_revision is not None and not old.player_id):
+            return old.rating_key != new.rating_key
+        return (old.player_id, old.rating_key, old.user) != (new.player_id, new.rating_key, new.user)
+
+    @staticmethod
     def _newest_session_key(keys):
         """Prefer Plex's increasing numeric session keys, preserving input order otherwise."""
         numeric = [(int(key), key) for key in keys if str(key).isdigit()]
@@ -463,20 +475,22 @@ class StateManager:
             if self.theaters:
                 ignored = {theater.name for theater in self.theaters if theater.ignored}
                 owned = [entry['base'] for theater in self.theaters for entry in theater.owned.values()]
+                reporters = {entry['plex_client_id'] for theater in self.theaters
+                             for entry in theater.owned.values()} - {None}
                 for key in list(self.sessions):
                     obs = self.sessions[key].observation
                     if obs.theater_details and obs.theater_details['instance'] in ignored:
                         del self.sessions[key]
                         logger.info('Session=%r released because Theater theater=%s is ignored',
                                     key, obs.theater_details['instance'])
-                    elif obs.theater_revision is None and any(
+                    elif obs.theater_revision is None and (obs.player_id in reporters or any(
                             (obs.session_id and obs.session_id == base.session_id) or
-                            (obs.transcode_key and obs.transcode_key == base.transcode_key) for base in owned):
+                            (obs.transcode_key and obs.transcode_key == base.transcode_key) for base in owned)):
                         del self.sessions[key]
                         logger.info('Session=%r transferred to exact Theater ownership; ordinary reservation removed', key)
             for key, obs in observations.items():
                 tracked = self.sessions.get(key)
-                if tracked and (tracked.observation.player_id, tracked.observation.rating_key, tracked.observation.user) != (obs.player_id, obs.rating_key, obs.user):
+                if tracked and self._identity_changed(tracked.observation, obs):
                     logger.info('Session=%r identity changed; discarding previous state', key)
                     del self.sessions[key]
                     tracked = None
@@ -501,10 +515,11 @@ class StateManager:
                 previous = tracked.playback
                 if obs.bandwidth_kbps is not None and (active or tracked.bandwidth_kbps is None):
                     if tracked.bandwidth_kbps != obs.bandwidth_kbps:
-                        logger.info('Session=%r bandwidth_kbps %s -> %s (Plex reservation)',
-                                    key, tracked.bandwidth_kbps, obs.bandwidth_kbps)
+                        logger.info('Session=%r bandwidth_kbps %s -> %s (%s reservation)',
+                                    key, tracked.bandwidth_kbps, obs.bandwidth_kbps,
+                                    'Plex' if obs.bandwidth_source == 'plex_session' else 'Theater')
                     tracked.bandwidth_kbps = obs.bandwidth_kbps
-                    tracked.bandwidth_source = 'plex_session'
+                    tracked.bandwidth_source = obs.bandwidth_source
                 elif tracked.bandwidth_kbps is not None:
                     tracked.bandwidth_source = 'last_known'
                 else:

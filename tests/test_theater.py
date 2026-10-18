@@ -1,8 +1,10 @@
 import copy
+import logging
 from decimal import Decimal
 
 import pytest
 
+import app
 from app import Config, RedactingFormatter, numbered_theaters
 from controller import StateManager, qbt_budget, upload_budget
 from theater import Theater, validate_snapshot, viewer_weight
@@ -26,6 +28,19 @@ def plex(sid='hls-1', key='1', bandwidth='12000', local='1', user='Bot', rating=
     item.find('Session').set('id', sid)
     item.find('User').set('id', '7')
     return item
+
+
+def ffmpeg(sid='hls-1', viewers=1, kbps=8000, source='measured', client=None, **kwargs):
+    s = stream(sid, viewers, **kwargs)
+    s.update(engine='ffmpeg', plex_client_id=client)
+    if kbps is not None:
+        s.update(bandwidth_kbps=kbps, bandwidth_source=source)
+    return s
+
+
+def reporter(client='plex-discord-theater-hls-1', key='1', local='1', bandwidth=None, rating='42'):
+    # Theater's Now Playing row for an ffmpeg stream: its own player, no Session id or bandwidth.
+    return plex('', key, bandwidth=bandwidth, local=local, rating=rating, player=client)
 
 
 def enable(rig, monkeypatch, *streams):
@@ -364,6 +379,8 @@ def test_replacement_stream_not_yet_listed_by_plex_keeps_previous_bandwidth(rig,
     assert set(rig.m.sessions) == {'theater:new'} and not t.uncertain
     assert rig.m.status()['reserved_bandwidth_mbps'] == 19.2
     assert rig.q.prefs['alt_up_limit'] != rig.m.cfg.min_upload_bps
+    # Bridged from one of Plex's, it plays on the player that one did.
+    assert rig.m.sessions['theater:new'].observation.player_id == 'player-1'
     rig.poll(10, plex('new', '11', bandwidth='13000'))
     assert rig.m.status()['reserved_bandwidth_mbps'] == 20.8
 
@@ -421,3 +438,350 @@ def test_custom_plex_stale_timeout_overrides_relaxation_debounce(rig):
 def test_theater_config_validation(kwargs):
     with pytest.raises(ValueError):
         Config(**kwargs)
+
+
+@pytest.mark.parametrize('field,value', [('engine', 'ffmpeg'), ('engine', 'plex'), ('bandwidth_kbps', 1),
+    ('bandwidth_kbps', 10_000_000), ('bandwidth_source', 'measured'), ('bandwidth_source', 'target'),
+    ('plex_client_id', None), ('plex_client_id', 'c'), ('plex_client_id', 'c' * 256), ('future_key', {'any': 1})])
+def test_ffmpeg_stream_keys_accepted(field, value):
+    s = stream()
+    s[field] = value
+    assert validate_snapshot(snapshot(s))['streams'][0][field] == value
+
+
+@pytest.mark.parametrize('field,value', [('engine', 'vlc'), ('engine', None), ('engine', ''),
+    ('bandwidth_kbps', 0), ('bandwidth_kbps', -1), ('bandwidth_kbps', 10_000_001), ('bandwidth_kbps', True),
+    ('bandwidth_kbps', 8000.0), ('bandwidth_kbps', '8000'), ('bandwidth_kbps', None),
+    ('bandwidth_source', 'guessed'), ('bandwidth_source', None), ('plex_client_id', ''),
+    ('plex_client_id', 'c' * 257), ('plex_client_id', 7), ('plex_client_id', ['c'])])
+def test_invalid_ffmpeg_stream_keys_rejected(field, value):
+    s = ffmpeg(client='plex-discord-theater-hls-1')
+    s[field] = value
+    with pytest.raises(ValueError):
+        validate_snapshot(snapshot(s))
+
+
+def test_plex_engine_stream_without_new_keys_is_matched_as_before(rig, monkeypatch):
+    t = enable(rig, monkeypatch, stream(viewers=2))
+    rig.poll(0, plex())
+    session = rig.m.status()['sessions']['theater:hls-1']
+    assert session['bandwidth_kbps'] == 19200 and session['bandwidth_source'] == 'plex_session'
+    assert session['theater']['plex_bandwidth_kbps'] == 12000 and not t.uncertain
+    assert [session['theater'][k] for k in ('engine', 'bandwidth_kbps', 'bandwidth_source', 'plex_client_id')] == [None] * 4
+
+
+@pytest.mark.parametrize('viewers,mode,kbps', [(1, 'direct_p2p', 8000), (3, 'direct_p2p', 19200), (3, 'vps_relay', 8000)])
+def test_ffmpeg_stream_without_plex_row_reserves_theater_bandwidth(rig, monkeypatch, viewers, mode, kbps):
+    t = enable(rig, monkeypatch, ffmpeg(viewers=viewers))
+    t.snapshot['delivery_mode'] = mode
+    rig.poll(0)
+    assert set(rig.m.sessions) == {'theater:hls-1'} and not t.uncertain
+    assert rig.m.status()['reserved_bandwidth_mbps'] == kbps / 1000
+    assert rig.m.status()['unknown_bandwidth_sessions'] == 0
+    assert rig.q.prefs['alt_up_limit'] == qbt_budget(rig.m.cfg, upload_budget(rig.m.cfg, kbps))
+
+
+def test_ffmpeg_reporter_rows_are_claimed_once_and_keep_theater_bandwidth(rig, monkeypatch):
+    client = 'plex-discord-theater-hls-1'
+    t = enable(rig, monkeypatch, ffmpeg(viewers=2, client=client))
+    # Remote, so either row counted raw would add to the budget; the newer one carries the
+    # file's bitrate, which is not what ffmpeg makes of it.
+    rig.poll(0, reporter(client, '1', local='0'), reporter(client, '2', local='0', bandwidth='20000'),
+             plex('ordinary', '3', bandwidth='5000', local='0', user='Friend', player='phone'))
+    status = rig.m.status()
+    assert set(rig.m.sessions) == {'theater:hls-1', '3'} and not t.uncertain
+    # 8 Mbps × 2 viewers × 0.8 + the ordinary 5 Mbps.
+    assert status['reserved_bandwidth_mbps'] == 17.8
+    assert status['unknown_bandwidth_sessions'] == 0
+    details = status['sessions']['theater:hls-1']['theater']
+    assert (details['plex_user'], details['plex_user_id'], details['plex_client_id']) == ('Bot', '7', client)
+    assert details['plex_bandwidth_kbps'] == 20000 and details['bandwidth_kbps'] == 8000
+    assert rig.q.prefs['alt_up_limit'] == qbt_budget(rig.m.cfg, upload_budget(rig.m.cfg, 17800))
+
+
+def test_ffmpeg_stream_listed_by_plex_a_poll_late_is_not_reset(rig, monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger='plex-qbt')
+    client = 'plex-discord-theater-hls-1'
+    t = enable(rig, monkeypatch, ffmpeg(viewers=2, client=client))
+    rig.poll(0)
+    assert rig.m.status()['sessions']['theater:hls-1']['theater']['plex_user'] == ''
+    t.received = 5
+    rig.poll(5, reporter(client))
+    session = rig.m.status()['sessions']['theater:hls-1']
+    assert session['theater']['plex_user'] == 'Bot' and session['bandwidth_kbps'] == 12800
+    assert 'identity changed' not in caplog.text
+
+
+def test_ffmpeg_pause_holds_reservation_for_pause_grace(rig, monkeypatch):
+    t = enable(rig, monkeypatch, ffmpeg(viewers=3))
+    rig.poll(0)
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 19.2
+    # While paused ffmpeg's lead, and so its measurement, changes; what was reserved playing holds.
+    for now in (10, 69, 70):
+        t.snapshot = snapshot(ffmpeg(viewers=3, kbps=2000, state='paused', revision=2, age=now - 10))
+        t.received = now
+        rig.poll(now)
+        assert rig.q.mode == (now < 70)
+        if now < 70:
+            assert rig.m.status()['reserved_bandwidth_mbps'] == 19.2
+    t.snapshot = snapshot(ffmpeg(viewers=3, kbps=9000, revision=3))
+    t.received = 80
+    rig.poll(80)
+    assert rig.q.mode and rig.m.status()['reserved_bandwidth_mbps'] == 21.6
+
+
+def test_ffmpeg_zero_viewers_hold_reservation_for_stop_grace(rig, monkeypatch):
+    t = enable(rig, monkeypatch, ffmpeg(viewers=3))
+    rig.poll(0)
+    t.snapshot = snapshot(ffmpeg(viewers=0))
+    t.received = 10
+    rig.poll(10)
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 19.2
+    assert rig.m.status()['sessions']['theater:hls-1']['state'] == 'stopped'
+    t.received = 39
+    rig.poll(39)
+    assert rig.q.mode
+    t.received = 40
+    rig.poll(40)
+    assert not rig.q.mode and not rig.m.sessions
+
+
+def test_ffmpeg_stream_without_bandwidth_falls_back_to_plex_matching(rig, monkeypatch):
+    client = 'plex-discord-theater-hls-1'
+    t = enable(rig, monkeypatch, ffmpeg(viewers=2, kbps=None, client=client))
+    rig.poll(0, reporter(client, local='0'))
+    # Nothing Plex lists has its session id: as for any unmatched stream, the minimum budget.
+    # The reporter's row is still Theater's, never counted as an ordinary stream.
+    assert t.uncertain and not rig.m.sessions
+    assert rig.q.prefs['alt_up_limit'] == rig.m.cfg.min_upload_bps
+    t.snapshot = snapshot(ffmpeg(viewers=2, kbps=None))
+    t.received = 5
+    rig.poll(5, plex())
+    assert not t.uncertain and rig.m.status()['reserved_bandwidth_mbps'] == 19.2
+    assert rig.m.status()['sessions']['theater:hls-1']['bandwidth_source'] == 'plex_session'
+
+
+def test_ffmpeg_stream_losing_bandwidth_keeps_its_last_theater_figure(rig, monkeypatch):
+    t = enable(rig, monkeypatch, ffmpeg(viewers=2))
+    rig.poll(0)
+    t.snapshot = snapshot(ffmpeg(viewers=2, kbps=None))
+    t.received = 5
+    rig.poll(5)
+    # Owned already, so matching goes on from what it last had, as a Plex row gone quiet does.
+    assert not t.uncertain and rig.m.status()['reserved_bandwidth_mbps'] == 12.8
+    assert rig.m.status()['sessions']['theater:hls-1']['bandwidth_source'] == 'theater_snapshot'
+
+
+def test_ffmpeg_seek_moves_reservation_to_the_new_session(rig, monkeypatch):
+    client = 'plex-discord-theater-old'
+    t = enable(rig, monkeypatch, ffmpeg('old', viewers=2, client=client))
+    rig.poll(0, reporter(client, local='0'))
+    # A seek starts a new session; the reporter keeps the stream's first one as its player.
+    t.snapshot = snapshot(ffmpeg('new', viewers=2, kbps=9000, source='target', client=client, revision=2), sequence=2)
+    t.received = 5
+    rig.poll(5, reporter(client, local='0'))
+    assert set(rig.m.sessions) == {'theater:new'} and set(t.owned) == {'new'}
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 14.4 and not t.uncertain
+    assert rig.m.status()['sessions']['theater:new']['theater']['bandwidth_source'] == 'target'
+
+
+@pytest.mark.parametrize('state', ['playing', 'paused'])
+@pytest.mark.parametrize('row', [None, 'reporter', 'reporter_with_session_id'])
+def test_removed_ffmpeg_room_gets_its_stop_grace_from_removal(rig, monkeypatch, state, row):
+    client = 'plex-discord-theater-hls-1' if row else None
+
+    def rows(now):
+        # The reporter tells Plex the stream stopped only some seconds after it has gone,
+        # and Plex drops the row inside the stop grace. With reporting off there is none.
+        if row is None or now >= 25:
+            return []
+        item = plex('hls-1' if row == 'reporter_with_session_id' else '', bandwidth=None, local='0', player=client)
+        item.find('Player').set('state', state)
+        return [item]
+
+    t = enable(rig, monkeypatch, ffmpeg(viewers=2, client=client))
+    rig.poll(0, *rows(0))
+    if state == 'paused':
+        t.snapshot = snapshot(ffmpeg(viewers=2, client=client, state='paused', revision=2), sequence=2)
+        t.received = 5
+        rig.poll(5, *rows(5))
+    t.snapshot = snapshot(sequence=3)
+    for now in (10, 20, 25, 39):
+        t.received = now
+        rig.poll(now, *rows(now))
+        # Released as an unlisted stream is, the row never counted as an ordinary one.
+        assert set(rig.m.sessions) == {'theater:hls-1'} and not t.owned
+        assert rig.m.status()['sessions']['theater:hls-1']['state'] == 'missing'
+        assert rig.m.status()['unknown_bandwidth_sessions'] == 0
+        assert rig.q.prefs['alt_up_limit'] == qbt_budget(rig.m.cfg, upload_budget(rig.m.cfg, 12800))
+    t.received = 40
+    rig.poll(40)
+    assert not rig.q.mode and not rig.m.sessions and not t.retired_clients
+
+
+@pytest.mark.parametrize('state', ['playing', 'paused'])
+def test_late_snapshot_transfers_raw_reporter_row(rig, monkeypatch, state):
+    client = 'plex-discord-theater-hls-1'
+    rig.poll(0, reporter(client, local='0'))
+    assert rig.m.status()['unknown_bandwidth_sessions'] == 1
+    # Paused, the stream owns no device for an unmatched row to be suppressed by.
+    enable(rig, monkeypatch, ffmpeg(viewers=2, client=client, state=state))
+    item = reporter(client, local='0')
+    item.find('Player').set('state', state)
+    rig.poll(5, item)
+    assert set(rig.m.sessions) == {'theater:hls-1'}
+    assert rig.m.status()['unknown_bandwidth_sessions'] == 0
+    assert rig.q.prefs['alt_up_limit'] == qbt_budget(rig.m.cfg, upload_budget(rig.m.cfg, 12800))
+
+
+def test_one_theater_behind_two_urls_with_ffmpeg_uses_minimum_budget(rig, monkeypatch):
+    enable(rig, monkeypatch, ffmpeg('a', 2))
+    add_theater(rig, monkeypatch, '2', ffmpeg('a', 2))
+    rig.poll(0)
+    assert rig.m.theaters[1].uncertain
+    assert rig.q.prefs['alt_up_limit'] == rig.m.cfg.min_upload_bps
+
+
+def test_status_and_debug_log_show_ffmpeg_engine_source_and_bandwidth(rig, monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG, logger='plex-qbt')
+    monkeypatch.setattr(app, 'state', rig.m)
+    client = 'plex-discord-theater-a'
+    enable(rig, monkeypatch, ffmpeg('a', viewers=3, kbps=8450, client=client), stream('b', 2))
+    rig.poll(0, reporter(client, '1'), plex('b', '2'))
+    status = app.app.test_client().get('/status').get_json()
+    measured, matched = status['sessions']['theater:a'], status['sessions']['theater:b']
+    # 8.45 Mbps × 3 viewers × 0.8, not the minimum budget.
+    assert measured['bandwidth_kbps'] == 20280 and measured['bandwidth_source'] == 'theater_snapshot'
+    assert {k: measured['theater'][k] for k in ('engine', 'bandwidth_kbps', 'bandwidth_source', 'plex_client_id')} == {
+        'engine': 'ffmpeg', 'bandwidth_kbps': 8450, 'bandwidth_source': 'measured', 'plex_client_id': client}
+    assert matched['bandwidth_source'] == 'plex_session' and matched['theater']['engine'] is None
+    assert status['reserved_bandwidth_mbps'] == 39.48 and not status['theater']['uncertain']
+    assert status['desired_upload_bps'] == qbt_budget(rig.m.cfg, upload_budget(rig.m.cfg, 39480))
+    assert f"effective_kbps=20280.0 state=playing revision=('boot-1', 1) matched=True engine=ffmpeg " \
+           f"bandwidth_source=measured plex_client_id={client!r}" in caplog.text
+    assert 'bandwidth_kbps None -> 20280.0 (Theater reservation)' in caplog.text
+
+
+def test_ffmpeg_episode_change_keeps_previous_reporter_row_out_of_budget(rig, monkeypatch):
+    t = enable(rig, monkeypatch, ffmpeg('ep1', viewers=2, client='plex-discord-theater-ep1'))
+    rig.poll(0, reporter('plex-discord-theater-ep1', '1', local='0'))
+    t.snapshot = snapshot(ffmpeg('ep2', viewers=2, kbps=6000, client='plex-discord-theater-ep2',
+                                 rating='43', revision=2), sequence=2)
+    # Plex lists the first episode's row until the reporter says it stopped, polls later.
+    for now in (5, 10, 15):
+        t.received = now
+        rig.poll(now, reporter('plex-discord-theater-ep1', '1', local='0'),
+                 reporter('plex-discord-theater-ep2', '2', local='0', rating='43'))
+        assert set(rig.m.sessions) == {'theater:ep2'} and not t.uncertain
+        assert rig.m.status()['reserved_bandwidth_mbps'] == 9.6
+    assert rig.q.prefs['alt_up_limit'] == qbt_budget(rig.m.cfg, upload_budget(rig.m.cfg, 9600))
+    t.received = 20
+    rig.poll(20, reporter('plex-discord-theater-ep2', '2', local='0', rating='43'))
+    assert not t.retired_clients
+
+
+def test_ffmpeg_seek_while_paused_does_not_keep_the_old_session_owned(rig, monkeypatch):
+    client = 'plex-discord-theater-old'
+    t = enable(rig, monkeypatch, ffmpeg('old', viewers=2, client=client))
+    rig.poll(0, reporter(client))
+    t.snapshot = snapshot(ffmpeg('old', viewers=2, client=client, state='paused', revision=2), sequence=2)
+    t.received = 5
+    rig.poll(5, reporter(client))
+    # Paused, so no handoff: the old session gets its stop grace as an unlisted one does today.
+    t.snapshot = snapshot(ffmpeg('new', viewers=2, client=client, state='paused', revision=2), sequence=3)
+    t.received = 10
+    rig.poll(10, reporter(client))
+    assert set(t.owned) == {'new'}
+    assert rig.m.status()['sessions']['theater:old']['state'] == 'missing'
+    t.received = 40
+    rig.poll(40, reporter(client))
+    assert set(rig.m.sessions) == {'theater:new'}
+
+
+@pytest.mark.parametrize('state', ['playing', 'paused'])
+def test_reporter_row_listed_with_the_first_session_id_is_still_only_the_reporters(rig, monkeypatch, state):
+    client = 'plex-discord-theater-hls-1'
+    # The reporter's X-Plex-Session-Identifier is the stream's first hls session id. Phase 0
+    # saw Plex list no Session id for its row, but nothing promises Plex never will.
+    row = lambda: plex('hls-1', bandwidth=None, local='0', player=client)
+    t = enable(rig, monkeypatch, ffmpeg(viewers=2, client=client))
+    rig.poll(0, row())
+    assert set(rig.m.sessions) == {'theater:hls-1'} and not t.uncertain
+    assert rig.q.prefs['alt_up_limit'] == qbt_budget(rig.m.cfg, upload_budget(rig.m.cfg, 12800))
+    # A seek's new session keeps the reporter's player, and the row its first session id.
+    t.snapshot = snapshot(ffmpeg('new', viewers=2, client=client, state=state, revision=2), sequence=2)
+    t.received = 5
+    rig.poll(5, row())
+    assert set(t.owned) == {'new'} and not t.uncertain
+    assert rig.m.status()['unknown_bandwidth_sessions'] == 0
+    if state == 'playing':
+        assert set(rig.m.sessions) == {'theater:new'} and rig.m.status()['reserved_bandwidth_mbps'] == 12.8
+
+
+def test_reporter_row_with_the_session_id_between_a_seeks_sessions_is_still_only_the_reporters(rig, monkeypatch):
+    client = 'plex-discord-theater-hls-1'
+    row = lambda: plex('hls-1', bandwidth=None, local='0', player=client)
+    t = enable(rig, monkeypatch, ffmpeg(viewers=2, client=client))
+    rig.poll(0, row())
+    # A seek's old session, its run stopped and the new one not yet announced: Theater sends
+    # engine and player but no figure (sync.ts ffmpegStreamFacts), and the stream goes on
+    # from what it had. Its reporter row, even listed with this Session id, isn't a second one.
+    t.snapshot = snapshot(ffmpeg(viewers=2, kbps=None, client=client), sequence=2)
+    t.received = 5
+    rig.poll(5, row())
+    assert not t.uncertain and set(rig.m.sessions) == {'theater:hls-1'}
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 12.8
+
+
+@pytest.mark.parametrize('engine', [None, 'plex'])
+def test_theater_bandwidth_counts_only_for_ffmpeg_streams(rig, monkeypatch, engine):
+    s = stream(viewers=2)
+    s.update(bandwidth_kbps=1000, bandwidth_source='measured')
+    if engine:
+        s['engine'] = engine
+    t = enable(rig, monkeypatch, s)
+    rig.poll(0, plex())
+    # Whatever else it carries, a stream Plex transcodes is reserved from Plex's figure.
+    session = rig.m.status()['sessions']['theater:hls-1']
+    assert session['bandwidth_kbps'] == 19200 and session['bandwidth_source'] == 'plex_session'
+    assert session['theater']['plex_bandwidth_kbps'] == 12000 and not t.uncertain
+
+
+@pytest.mark.parametrize('client', [None, 'plex-discord-theater-hls-1'])
+def test_ffmpeg_stream_not_listed_by_plex_plays_on_its_reporters_player(rig, monkeypatch, client):
+    enable(rig, monkeypatch, ffmpeg(viewers=2, client=client))
+    rig.poll(0)
+    obs = rig.m.sessions['theater:hls-1'].observation
+    assert (obs.player_id, obs.user, obs.session_id, obs.rating_key) == (client or '', '', 'hls-1', '42')
+
+
+def test_reporter_row_lagging_behind_the_stream_title_keeps_the_streams(rig, monkeypatch):
+    client = 'plex-discord-theater-hls-1'
+    t = enable(rig, monkeypatch, ffmpeg(viewers=2, client=client, rating='43'))
+    # Plex lists what the reporter last told it, which can trail the stream it reports.
+    rig.poll(0, reporter(client, local='0', rating='42'))
+    assert set(rig.m.sessions) == {'theater:hls-1'} and not t.uncertain
+    assert rig.m.sessions['theater:hls-1'].observation.rating_key == '43'
+    assert rig.m.status()['sessions']['theater:hls-1']['theater']['plex_user'] == 'Bot'
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 12.8
+
+
+def test_plex_stream_bridged_from_an_ffmpeg_one_says_whose_figure_it_reserves(rig, monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger='plex-qbt')
+    client = 'plex-discord-theater-hls-1'
+    t = enable(rig, monkeypatch, ffmpeg(viewers=2, kbps=8450, client=client))
+    rig.poll(0, reporter(client, '1', local='0', bandwidth='20000'))
+    # The room's next title plays through Plex, which lists its transcode a poll or two later.
+    t.snapshot = snapshot(stream('next', 2, rating='43', revision=2), sequence=2)
+    for now, rows in ((5, ()), (10, (plex('next', '2', bandwidth=None, rating='43'),))):
+        t.received = now
+        rig.poll(now, reporter(client, '1', local='0', bandwidth='20000'), *rows)
+        session = rig.m.status()['sessions']['theater:next']
+        assert session['bandwidth_kbps'] == 13520 and session['bandwidth_source'] == 'theater_snapshot'
+        assert session['theater']['plex_bandwidth_kbps'] is None and session['theater']['engine'] is None
+    t.received = 15
+    rig.poll(15, reporter(client, '1', local='0', bandwidth='20000'), plex('next', '2', bandwidth='7000', rating='43'))
+    session = rig.m.status()['sessions']['theater:next']
+    assert session['bandwidth_kbps'] == 11200 and session['bandwidth_source'] == 'plex_session'
+    assert session['theater']['plex_bandwidth_kbps'] == 7000 and not t.uncertain
+    assert set(rig.m.sessions) == {'theater:next'} and 'identity changed' not in caplog.text

@@ -1,4 +1,8 @@
-"""Authenticated Theater snapshots and exact Plex-session ownership overlays."""
+"""Authenticated Theater snapshots and exact Plex-session ownership overlays.
+
+Streams Theater's ffmpeg engine makes are nothing Plex serves, so for those
+Theater's snapshot gives the bandwidth itself (bandwidth_kbps, decimal kbps).
+"""
 import json
 import logging
 import math
@@ -59,6 +63,17 @@ def validate_snapshot(value):
                 continue
             if type(age) not in (int, float) or not math.isfinite(age) or age < 0:
                 raise ValueError(f'Invalid Theater {key}')
+        # Only an ffmpeg stream carries these; Plex-engine streams and older Theaters omit them.
+        if 'engine' in stream and stream['engine'] not in ('ffmpeg', 'plex'):
+            raise ValueError('Invalid Theater stream engine')
+        if 'bandwidth_kbps' in stream and (type(stream['bandwidth_kbps']) is not int or
+                                           not 1 <= stream['bandwidth_kbps'] <= 10_000_000):
+            raise ValueError('Invalid Theater bandwidth_kbps')
+        if 'bandwidth_source' in stream and stream['bandwidth_source'] not in ('measured', 'target'):
+            raise ValueError('Invalid Theater bandwidth_source')
+        client = stream.get('plex_client_id')
+        if client is not None and (not isinstance(client, str) or not 1 <= len(client) <= 256):
+            raise ValueError('Invalid Theater plex_client_id')
     return value
 
 
@@ -90,6 +105,8 @@ class Theater:
         self.attempted = float('-inf')
         self.error = None
         self.owned = {}
+        # Reporter players (plex_client_id) of ffmpeg streams retired by a title change or removal.
+        self.retired_clients = set()
         self.uncertain = False
         self.server_mismatch = False
         self.ignored = False
@@ -141,6 +158,7 @@ class Theater:
                                round(age, 1) if age is not None else None, self.cfg.theater_stale_seconds)
             self.ignored, self.uncertain = True, False
             self.owned.clear()
+            self.retired_clients.clear()
             return {}, set()
         if self.ignored:
             logger.info('Theater theater=%s answering again; counting its streams', self.name)
@@ -159,6 +177,7 @@ class Theater:
         # retire their ownership now instead of returning them for stop grace.
         active_titles = {}
         active_sessions = {}
+        clients = {stream.get('plex_client_id') for stream in streams} - {None}
         for stream in streams:
             if stream['viewer_count'] and stream['state'] == 'playing':
                 active_titles.setdefault(stream['room_id'], set()).add(stream['rating_key'])
@@ -175,18 +194,42 @@ class Theater:
                            (base.transcode_key and o.transcode_key == base.transcode_key))
             del self.owned[sid]
             handed_off.setdefault(details.get('room_id'), base)
+            if old['plex_client_id'] and old['plex_client_id'] not in clients:
+                self.retired_clients.add(old['plex_client_id'])
             logger.info('Theater ownership handoff theater=%s room=%r old_session=%s old_rating=%r new_rating=%r; '
                         'lingering Plex session suppressed', self.name, details.get('room_id'), sid,
                         base.rating_key, next(iter(ratings)))
+        # The reporter tells Plex an ffmpeg stream stopped only some seconds after it has gone,
+        # so the previous title's row lingers on its own player, which no device handoff
+        # shares. Until Plex drops it the row is still Theater's, though nothing to reserve.
+        self.retired_clients &= {o.player_id for o in observations.values()}
+        matched.update(o.key for o in observations.values() if o.player_id in self.retired_clients)
         present = set()
         for stream in streams:
             sid = stream['hls_session_id']
             present.add(sid)
             equivalent_duplicates = False
-            exact = [o for o in observations.values() if o.session_id == sid]
-            if not exact and stream['plex_transcode_key']:
-                key = stream['plex_transcode_key'].rstrip('/').split('/')[-1]
-                exact = [o for o in observations.values() if o.transcode_key and o.transcode_key == key]
+            # Theater's reporter (ffmpeg/plex-report.ts) shows an ffmpeg stream in Plex's Now
+            # Playing on a player of its own. Phase 0 (17 October) saw that row with no Session
+            # id to match it by; it is this stream whatever else happens, never an ordinary one.
+            client = stream.get('plex_client_id')
+            reported = [o for o in observations.values() if client and o.player_id == client]
+            matched.update(o.key for o in reported)
+            # Plex never sees what ffmpeg makes, so Theater says what one viewer of it downloads.
+            measured = stream.get('bandwidth_kbps') if stream.get('engine') == 'ffmpeg' else None
+            row = newest_observation(reported) if reported else None
+            exact = []
+            # Plex makes nothing of an ffmpeg stream, so its reporter's row, matched by player
+            # above, is all there is of it. Matched again by a Session id Plex might one day
+            # list for it, that row would be found already claimed and the stream ambiguous —
+            # also while Theater sends no figure, in the moment between a seek's sessions.
+            if measured is None:
+                mine = {o.key for o in reported}
+                exact = [o for o in observations.values() if o.session_id == sid and o.key not in mine]
+                if not exact and stream['plex_transcode_key']:
+                    key = stream['plex_transcode_key'].rstrip('/').split('/')[-1]
+                    exact = [o for o in observations.values()
+                             if o.transcode_key and o.transcode_key == key and o.key not in mine]
             if len(exact) > 1:
                 signatures = {(o.player_id, o.rating_key, o.user_id or o.user)
                               for o in exact}
@@ -215,15 +258,29 @@ class Theater:
                 continue
             old = self.owned.get(sid)
             base = exact[0] if exact else (old['base'] if old else None)
+            if measured is not None:
+                # The reporter's row, when Plex lists it, says whose account the stream plays
+                # under; until then (or with reporting off) the stream stands for itself.
+                if row is None and base is None:
+                    from controller import Observation  # controller imports this module
+                    base = Observation(key='theater:' + sid, player_id=client or '', rating_key=stream['rating_key'],
+                                       user='', playback=stream['state'], bandwidth_kbps=None, session_id=sid)
+                base = replace(row or base, rating_key=stream['rating_key'], bandwidth_kbps=measured,
+                               bandwidth_source='theater_snapshot')
             if base is None and stream['room_id'] in handed_off:
                 # Plex lists a replacement transcode a poll or two after Theater announces it.
                 # Bridge that gap with the stream it replaced rather than the minimum budget.
-                base = replace(handed_off[stream['room_id']], session_id=sid, transcode_key='',
-                               rating_key=stream['rating_key'])
+                # An ffmpeg stream played on its reporter's player, which no transcode of
+                # Plex's is listed on, so the bridge keeps its figure but not its player.
+                replaced = handed_off[stream['room_id']]
+                base = replace(replaced, session_id=sid, transcode_key='', rating_key=stream['rating_key'],
+                               player_id=replaced.player_id if replaced.bandwidth_source == 'plex_session' else '')
                 logger.info('Theater theater=%s session=%s not yet listed by Plex; using replaced stream '
                             'bandwidth_kbps=%s', self.name, sid, base.bandwidth_kbps)
             if base and base.bandwidth_kbps is None and old:
-                base = replace(base, bandwidth_kbps=old['base'].bandwidth_kbps)
+                # A figure carried over keeps saying where it came from.
+                base = replace(base, bandwidth_kbps=old['base'].bandwidth_kbps,
+                               bandwidth_source=old['base'].bandwidth_source)
             if exact:
                 matched.add(exact[0].key)
             if base is None:
@@ -243,27 +300,47 @@ class Theater:
             since = now - stream['state_age_seconds'] - (now - self.received)
             if not stream['viewer_count']:
                 since = (old['zero_since'] if old['zero_since'] is not None else now) if old else now - self.cfg.stop_delay_seconds
+            # Only what Plex itself lists for the stream, never a figure Theater gave.
+            if measured is not None:
+                plex_kbps = row.bandwidth_kbps if row else None
+            else:
+                plex_kbps = base.bandwidth_kbps if base.bandwidth_source == 'plex_session' else None
             obs = replace(base, key='theater:' + sid, playback=state, bandwidth_kbps=bandwidth,
                           theater_revision=revision, state_since=since,
                           theater_details={'instance': self.name, 'room_id': stream['room_id'], 'variant_id': stream['variant_id'],
                                            'viewer_count': stream['viewer_count'], 'weight': float(weight),
                                            'plex_user': base.user, 'plex_user_id': base.user_id,
-                                           'plex_bandwidth_kbps': base.bandwidth_kbps,
+                                           'plex_bandwidth_kbps': plex_kbps,
+                                           'engine': stream.get('engine'), 'bandwidth_kbps': stream.get('bandwidth_kbps'),
+                                           'bandwidth_source': stream.get('bandwidth_source'), 'plex_client_id': client,
                                            'delivery_mode': self.snapshot['delivery_mode']})
-            self.owned[sid] = {'base': base, 'observation': obs, 'zero_since': since if not stream['viewer_count'] else None}
+            self.owned[sid] = {'base': base, 'observation': obs, 'zero_since': since if not stream['viewer_count'] else None,
+                               'plex_client_id': client}
             result[obs.key] = obs
             logger.debug('Theater theater=%s session=%s user=%r user_id=%r variant=%s viewers=%s factor=%s weight=%s '
-                         'base_kbps=%s effective_kbps=%s state=%s revision=%s matched=%s',
-                         self.name, sid, base.user, base.user_id, stream['variant_id'], stream['viewer_count'],
-                         self.cfg.theater_bandwidth_factor, weight, base.bandwidth_kbps, bandwidth, state, revision, bool(exact))
+                         'base_kbps=%s effective_kbps=%s state=%s revision=%s matched=%s engine=%s bandwidth_source=%s '
+                         'plex_client_id=%r', self.name, sid, base.user, base.user_id, stream['variant_id'],
+                         stream['viewer_count'], self.cfg.theater_bandwidth_factor, weight, base.bandwidth_kbps,
+                         bandwidth, state, revision, bool(exact or reported), stream.get('engine'),
+                         base.bandwidth_source if measured is None else stream.get('bandwidth_source'), client)
         # Retain stopped ownership while Plex keeps its transcode alive: never count it
         # again as an ordinary stream simply because Theater removed the room.
         for sid, old in list(self.owned.items()):
             if sid in present:
                 continue
             base = old['base']
-            exact = [o for o in observations.values() if (o.session_id and o.session_id == sid)
-                     or (o.transcode_key and o.transcode_key == base.transcode_key)]
+            # The reporter's row is no transcode Plex keeps alive: it lingers only until the
+            # reporter says the stream stopped, some seconds late. Retire it as a title change
+            # does, so it stays Theater's while the stop grace starts now, as with reporting
+            # off. A seek's new session keeps the reporter's player, so its row is that one's.
+            client = old['plex_client_id']
+            if client and client not in clients:
+                self.retired_clients.add(client)
+                matched.update(o.key for o in observations.values() if o.player_id == client)
+            # Nor is any row on a reporter's player, whatever Session id Plex lists for it.
+            reporters = clients | self.retired_clients
+            exact = [o for o in observations.values() if o.player_id not in reporters and (
+                (o.session_id and o.session_id == sid) or (o.transcode_key and o.transcode_key == base.transcode_key))]
             if not exact:
                 del self.owned[sid]
                 continue

@@ -17,7 +17,8 @@ when streaming stops, qBittorrent returns to its normal speed settings.
 - Supports multiple Plex streams without double counting session handoffs.
 - Integrates with
   [Plex Discord Theater](https://github.com/MonkeyGoneWIld/plex-discord-theater)
-  for viewer-aware bandwidth estimates, including several Theater instances at once.
+  for viewer-aware bandwidth estimates, including several Theater instances at once
+  and the bandwidth Theater's ffmpeg engine measures.
 - Runs as a lightweight Docker container on AMD64 and ARM64.
 
 No Tautulli, Tracearr, browser extension, or additional Plex account is needed.
@@ -121,7 +122,8 @@ choices.
 
 Because one Theater room can serve several viewers while appearing as only one
 or a few Plex sessions, this integration supplies the manager with viewer counts
-and Discord playback state. Plex remains the source of bandwidth data.
+and Discord playback state. Plex remains the source of bandwidth data, except
+for streams Theater's ffmpeg engine makes (see below).
 
 Use Plex Discord Theater v1.0.3 or newer. Set the same long, random secret in
 Theater's `QBT_MANAGER_API_KEY` and the manager's `THEATER_API_KEY`, then add these
@@ -156,6 +158,40 @@ streams are added together.
 | `THEATER_TIMEOUT_SECONDS` | `3` | Timeout for a Theater API request. |
 | `THEATER_STALE_SECONDS` | `30` | Seconds an unreachable Theater's last data keeps counting. After that, the instance is ignored until it answers again. |
 | `THEATER_URL_2`, `THEATER_API_KEY_2`, ... | Empty | Additional Theater instances. See below. |
+
+### Theater's ffmpeg engine
+
+With Theater's `PLAYBACK_ENGINE=ffmpeg`, Theater makes streams from the file
+itself, so Plex has no bandwidth for them. Theater reports what one viewer of
+each such stream downloads instead: measured from the segments ffmpeg has
+already made, or the stream's target bitrate just after it starts or seeks.
+The manager uses that figure in place of Plex's:
+
+```text
+Theater bandwidth × viewer count × THEATER_BANDWIDTH_FACTOR
+```
+
+The single-viewer, relay, pause and stop rules are the same as for Plex
+streams. Theater also shows these streams in Plex's Now Playing
+(`FFMPEG_REPORT_TO_PLEX`). The manager recognizes that Plex session by its
+player and does not count it a second time, including the seconds Plex keeps
+listing it after the stream stops. While Theater answers, turning reporting
+off does not change the budget. Once the manager has stopped counting an
+unreachable Theater (`THEATER_STALE_SECONDS`), those Plex sessions count as
+ordinary remote streams, as any other would.
+
+A Theater build whose ffmpeg engine does not report bandwidth gives the manager
+nothing to match those streams with, so it uses `MIN_UPLOAD_MIB` while they
+play. Streams played through Plex are unaffected either way.
+
+In `GET /status`, a Theater session's `bandwidth_kbps` is its reservation after
+viewer weighting, and its `bandwidth_source` is `theater_snapshot` for an ffmpeg
+stream or `plex_session` for a Plex one. Its `theater` details add `engine`,
+`bandwidth_kbps` (one viewer's), `bandwidth_source` (`measured` or `target`) and
+`plex_client_id` (the Plex player Theater reports the stream as). These are
+empty for streams played through Plex. When a room's next title plays through
+Plex after an ffmpeg one, its session keeps the ffmpeg stream's figure, and
+`theater_snapshot`, until Plex lists a bandwidth for the new stream.
 
 ### Multiple Theater instances
 
