@@ -237,7 +237,9 @@ def test_unmatched_or_foreign_snapshot_never_exempts_account(rig, monkeypatch, s
     rig.poll(0, plex(local='0'))
     assert '1' in rig.m.sessions
     assert rig.m.theaters[0].uncertain
-    assert rig.q.prefs['alt_up_limit'] == rig.m.cfg.min_upload_bps
+    # Uncertain is never the minimum: what Theater can't account for counts as nothing, and
+    # Plex's own row counts as the ordinary remote stream it is.
+    assert rig.q.prefs['alt_up_limit'] == qbt_budget(rig.m.cfg, upload_budget(rig.m.cfg, 12000))
     assert rig.m.status()['theater']['instances'][0]['plex_server_mismatch'] == (server == 'wrong-server')
 
 
@@ -286,12 +288,13 @@ def test_unreachable_instance_is_ignored_while_other_keeps_counting(rig, monkeyp
     assert rig.q.prefs['alt_up_limit'] == qbt_budget(rig.m.cfg, upload_budget(rig.m.cfg, 19200))
 
 
-def test_one_theater_behind_two_urls_uses_minimum_budget(rig, monkeypatch):
+def test_one_theater_behind_two_urls_counts_its_streams_once(rig, monkeypatch):
     enable(rig, monkeypatch, stream('a', 2))
     add_theater(rig, monkeypatch, '2', stream('a', 2))
     rig.poll(0, plex('a', '1'))
     assert rig.m.theaters[1].uncertain
-    assert rig.q.prefs['alt_up_limit'] == rig.m.cfg.min_upload_bps
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 19.2
+    assert rig.q.prefs['alt_up_limit'] == qbt_budget(rig.m.cfg, upload_budget(rig.m.cfg, 19200))
 
 
 def test_numbered_theater_instances_from_environment(monkeypatch):
@@ -550,10 +553,10 @@ def test_ffmpeg_stream_without_bandwidth_falls_back_to_plex_matching(rig, monkey
     client = 'plex-discord-theater-hls-1'
     t = enable(rig, monkeypatch, ffmpeg(viewers=2, kbps=None, client=client))
     rig.poll(0, reporter(client, local='0'))
-    # Nothing Plex lists has its session id: as for any unmatched stream, the minimum budget.
-    # The reporter's row is still Theater's, never counted as an ordinary stream.
+    # Nothing Plex lists has its session id: as for any unmatched stream, it counts as nothing,
+    # never the minimum. The reporter's row is still Theater's, never an ordinary stream.
     assert t.uncertain and not rig.m.sessions
-    assert rig.q.prefs['alt_up_limit'] == rig.m.cfg.min_upload_bps
+    assert not rig.q.mode
     t.snapshot = snapshot(ffmpeg(viewers=2, kbps=None))
     t.received = 5
     rig.poll(5, plex())
@@ -634,12 +637,12 @@ def test_late_snapshot_transfers_raw_reporter_row(rig, monkeypatch, state):
     assert rig.q.prefs['alt_up_limit'] == qbt_budget(rig.m.cfg, upload_budget(rig.m.cfg, 12800))
 
 
-def test_one_theater_behind_two_urls_with_ffmpeg_uses_minimum_budget(rig, monkeypatch):
+def test_one_theater_behind_two_urls_with_ffmpeg_counts_its_streams_once(rig, monkeypatch):
     enable(rig, monkeypatch, ffmpeg('a', 2))
     add_theater(rig, monkeypatch, '2', ffmpeg('a', 2))
     rig.poll(0)
     assert rig.m.theaters[1].uncertain
-    assert rig.q.prefs['alt_up_limit'] == rig.m.cfg.min_upload_bps
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 12.8
 
 
 def test_status_and_debug_log_show_ffmpeg_engine_source_and_bandwidth(rig, monkeypatch, caplog):
@@ -734,17 +737,26 @@ def test_reporter_row_with_the_session_id_between_a_seeks_sessions_is_still_only
 
 
 @pytest.mark.parametrize('engine', [None, 'plex'])
-def test_theater_bandwidth_counts_only_for_ffmpeg_streams(rig, monkeypatch, engine):
+def test_theater_bandwidth_counts_for_a_stream_of_plexs_too(rig, monkeypatch, engine):
     s = stream(viewers=2)
-    s.update(bandwidth_kbps=1000, bandwidth_source='measured')
+    s.update(bandwidth_kbps=2400, bandwidth_source='measured')
     if engine:
         s['engine'] = engine
     t = enable(rig, monkeypatch, s)
+    # A Direct Stream copy: Plex's figure is how fast it hands Theater the segments over the LAN.
+    rig.poll(0, plex(bandwidth='120980', local='0'))
+    session = rig.m.status()['sessions']['theater:hls-1']
+    assert set(rig.m.sessions) == {'theater:hls-1'} and not t.uncertain
+    assert session['bandwidth_kbps'] == 3840 and session['bandwidth_source'] == 'theater_snapshot'
+    assert session['theater']['plex_bandwidth_kbps'] == 120980
+    assert rig.q.prefs['alt_up_limit'] == qbt_budget(rig.m.cfg, upload_budget(rig.m.cfg, 3840))
+
+
+def test_plex_stream_without_theater_bandwidth_keeps_plexs(rig, monkeypatch):
+    enable(rig, monkeypatch, stream(viewers=2))
     rig.poll(0, plex())
-    # Whatever else it carries, a stream Plex transcodes is reserved from Plex's figure.
     session = rig.m.status()['sessions']['theater:hls-1']
     assert session['bandwidth_kbps'] == 19200 and session['bandwidth_source'] == 'plex_session'
-    assert session['theater']['plex_bandwidth_kbps'] == 12000 and not t.uncertain
 
 
 @pytest.mark.parametrize('client', [None, 'plex-discord-theater-hls-1'])

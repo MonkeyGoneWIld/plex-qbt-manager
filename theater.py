@@ -86,7 +86,7 @@ def overlay_all(theaters, observations, server_id):
             # Distinct Theaters never share a Plex session; this is one Theater behind two URLs.
             theater.uncertain = True
             logger.warning('Theater theater=%s claims Plex sessions owned by another instance; '
-                           'using minimum budget', theater.name)
+                           'not counting it twice', theater.name)
         result.update(owned)
         matched |= claimed
     for key, obs in observations.items():
@@ -166,7 +166,7 @@ class Theater:
         valid = self.snapshot['plex_server_id'] == server_id
         if not valid and not self.server_mismatch:
             logger.warning('Theater theater=%s reports Plex server=%r but PLEX_URL is server=%r; '
-                           'using minimum budget until they match', self.name, self.snapshot['plex_server_id'], server_id)
+                           'not counting its streams until they match', self.name, self.snapshot['plex_server_id'], server_id)
         self.server_mismatch = self.uncertain = not valid
         result = {}
         matched = set()
@@ -248,12 +248,12 @@ class Theater:
                 else:
                     self.uncertain = True
                     logger.warning('Theater ambiguous identity theater=%s room=%s variant=%s sessions=%r; '
-                                   'using minimum budget', self.name, stream['room_id'], stream['variant_id'],
+                                   'not counted', self.name, stream['room_id'], stream['variant_id'],
                                    [o.key for o in exact])
                     continue
             if exact and exact[0].key in matched and not equivalent_duplicates:
                 self.uncertain = True
-                logger.warning('Theater ambiguous identity theater=%s room=%s variant=%s; using minimum budget',
+                logger.warning('Theater ambiguous identity theater=%s room=%s variant=%s; not counted',
                                self.name, stream['room_id'], stream['variant_id'])
                 continue
             old = self.owned.get(sid)
@@ -269,7 +269,7 @@ class Theater:
                                bandwidth_source='theater_snapshot')
             if base is None and stream['room_id'] in handed_off:
                 # Plex lists a replacement transcode a poll or two after Theater announces it.
-                # Bridge that gap with the stream it replaced rather than the minimum budget.
+                # Bridge that gap with the stream it replaced rather than counting nothing.
                 # An ffmpeg stream played on its reporter's player, which no transcode of
                 # Plex's is listed on, so the bridge keeps its figure but not its player.
                 replaced = handed_off[stream['room_id']]
@@ -281,6 +281,18 @@ class Theater:
                 # A figure carried over keeps saying where it came from.
                 base = replace(base, bandwidth_kbps=old['base'].bandwidth_kbps,
                                bandwidth_source=old['base'].bandwidth_source)
+            # Theater's own figure for a stream of Plex's it measures, a Direct Stream copy: Plex's
+            # for a copy is how fast it hands the segments to Theater over the LAN, not what anyone
+            # downloads. On 18 October it was 121 Mbps for a film of 1 to 5, and the budget hit
+            # MIN_UPLOAD_MIB. The row is still matched above, and claimed, as any of Plex's.
+            from_plex = base.bandwidth_kbps if base and base.bandwidth_source == 'plex_session' else None
+            given = stream.get('bandwidth_kbps')
+            if measured is None and given is not None:
+                if base is None:
+                    from controller import Observation  # controller imports this module
+                    base = Observation(key='theater:' + sid, player_id='', rating_key=stream['rating_key'],
+                                       user='', playback=stream['state'], bandwidth_kbps=None, session_id=sid)
+                base = replace(base, bandwidth_kbps=given, bandwidth_source='theater_snapshot')
             if exact:
                 matched.add(exact[0].key)
             if base is None:
@@ -304,7 +316,7 @@ class Theater:
             if measured is not None:
                 plex_kbps = row.bandwidth_kbps if row else None
             else:
-                plex_kbps = base.bandwidth_kbps if base.bandwidth_source == 'plex_session' else None
+                plex_kbps = from_plex
             obs = replace(base, key='theater:' + sid, playback=state, bandwidth_kbps=bandwidth,
                           theater_revision=revision, state_since=since,
                           theater_details={'instance': self.name, 'room_id': stream['room_id'], 'variant_id': stream['variant_id'],

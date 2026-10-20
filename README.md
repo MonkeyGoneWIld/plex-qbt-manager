@@ -77,6 +77,12 @@ The manager adds the bandwidth of active remote streams, applies
 `BANDWIDTH_MULTIPLIER`, and subtracts that amount from the maximum. The result is
 kept between `MIN_UPLOAD_MIB` and `MAX_UPLOAD_MIB`.
 
+A failure never selects `MIN_UPLOAD_MIB`. A stream whose bandwidth isn't known,
+or that a Theater can't account for, counts as nothing; a stream that had a
+figure keeps it through its grace period. A Theater or Plex that stops
+answering keeps counting for `THEATER_STALE_SECONDS` or `PLEX_STALE_SECONDS`,
+then counts as nothing.
+
 For example, three streams using a combined 32 Mbps with a `1.5` multiplier
 reserve 48 Mbps for Plex. The conversion between Plex's Mbps and qBittorrent's
 MiB/s is handled automatically.
@@ -181,8 +187,13 @@ unreachable Theater (`THEATER_STALE_SECONDS`), those Plex sessions count as
 ordinary remote streams, as any other would.
 
 A Theater build whose ffmpeg engine does not report bandwidth gives the manager
-nothing to match those streams with, so it uses `MIN_UPLOAD_MIB` while they
-play. Streams played through Plex are unaffected either way.
+nothing to match those streams with, so they count as nothing while they play.
+Streams played through Plex are unaffected either way.
+
+Theater also sends `bandwidth_kbps` for the Direct Stream copies it measures
+from Plex. Plex's own figure for a copy is how fast it hands the segments to
+Theater over the LAN (121 Mbps for a 1 to 5 Mbps film, in one case), so the
+manager reserves Theater's figure instead, and still claims Plex's session.
 
 In `GET /status`, a Theater session's `bandwidth_kbps` is its reservation after
 viewer weighting, and its `bandwidth_source` is `theater_snapshot` for an ffmpeg
@@ -212,7 +223,7 @@ Continue with `THEATER_URL_3` and `THEATER_API_KEY_3` for a third instance.
 every instance.
 
 Every instance must use the same Plex server as `PLEX_URL`. If an instance
-reports a different Plex server, the manager uses `MIN_UPLOAD_MIB` until that is
+reports a different Plex server, its streams count as nothing until that is
 fixed. `GET /status` lists each instance under `theater.instances`.
 
 ### When a Theater is unreachable

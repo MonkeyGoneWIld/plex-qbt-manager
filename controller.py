@@ -78,9 +78,7 @@ def validate_config(cfg):
         raise ValueError('Upload range must contain at least one whole KiB/s (qBittorrent precision)')
 
 
-def upload_budget(cfg, bandwidth_kbps, unknown=False):
-    if unknown:
-        return cfg.min_upload_bps
+def upload_budget(cfg, bandwidth_kbps):
     reduction = Decimal(bandwidth_kbps) * 1000 * cfg.bandwidth_multiplier / 8
     return int(max(cfg.min_upload_bps, min(cfg.max_upload_bps, cfg.max_upload_bps - reduction)))
 
@@ -524,7 +522,7 @@ class StateManager:
                     tracked.bandwidth_source = 'last_known'
                 else:
                     if previous == 'new' or key in resumed:
-                        logger.warning('Session=%r bandwidth unavailable; dynamic upload uses minimum', key)
+                        logger.warning('Session=%r bandwidth unavailable; not counted until it has one', key)
                     tracked.bandwidth_source = 'unknown'
                 if active:
                     tracked.since = None
@@ -579,10 +577,14 @@ class StateManager:
                     for key in [k for k, s in self.sessions.items() if s.remaining(now) == 0]:
                         logger.info('Session=%r grace expired state=%s; released reservation', key, self.sessions[key].playback)
                         del self.sessions[key]
+                # What isn't known counts as nothing: a session with no figure yet, or a stream an
+                # uncertain Theater can't account for. A failure never forces the minimum; a stream
+                # that had a figure keeps it through its grace, and a Theater or Plex that stops
+                # answering keeps counting until its stale timeout, then counts as nothing.
                 total = sum(s.bandwidth_kbps or 0 for s in self.sessions.values())
                 unknown = any(s.bandwidth_kbps is None for s in self.sessions.values()) or any(theater.uncertain for theater in self.theaters)
-                want = not self.stale and (bool(self.sessions) or unknown)
-                calculated = upload_budget(self.cfg, total, unknown) if want and self.cfg.dynamic_upload_enabled else None
+                want = not self.stale and any(s.bandwidth_kbps is not None for s in self.sessions.values())
+                calculated = upload_budget(self.cfg, total) if want and self.cfg.dynamic_upload_enabled else None
                 limit = qbt_budget(self.cfg, calculated) if calculated is not None else None
                 self.calculated_upload_bps = calculated
                 decision = (want, limit, total, unknown, len(self.sessions))

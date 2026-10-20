@@ -104,7 +104,6 @@ def test_exact_user_example(multiplier, expected):
     assert upload_budget(cfg, 12000 + 5000 + 15000) == expected
     assert upload_budget(cfg, 0) == 12 * MIB
     assert upload_budget(cfg, 99999999) == MIB
-    assert upload_budget(cfg, 0, unknown=True) == MIB
 
 
 def test_fractional_bounds_round_inward():
@@ -154,8 +153,15 @@ def test_locality(local, location, remote):
 @pytest.mark.parametrize('bandwidth', [None, '', '0', '-1', 'NaN', 'bad'])
 def test_unknown_bandwidth(bandwidth, rig):
     rig.poll(0, xml_session(bandwidth=bandwidth))
-    assert rig.q.prefs['alt_up_limit'] == MIB
+    # A session with no figure counts as nothing, never as the minimum: alone, no alternative speeds.
+    assert not rig.q.mode
     assert rig.m.status()['unknown_bandwidth_sessions'] == 1
+
+
+def test_unknown_bandwidth_beside_a_known_one_counts_nothing(rig):
+    rig.poll(0, xml_session(bandwidth=None), xml_session('2', bandwidth='5000'))
+    assert rig.q.mode and rig.m.status()['reserved_bandwidth_mbps'] == 5
+    assert rig.q.prefs['alt_up_limit'] == qbt_budget(rig.m.cfg, upload_budget(rig.m.cfg, 5000))
 
 
 def test_sum_dedup_and_token_endpoint(rig):
@@ -416,7 +422,7 @@ def test_reused_session_key_does_not_retain_old_bandwidth(rig):
     rig.poll(0, xml_session())
     rig.poll(5, xml_session(rating='new-item', bandwidth=None))
     assert rig.m.sessions['1'].bandwidth_kbps is None
-    assert rig.q.prefs['alt_up_limit'] == MIB
+    assert not rig.q.mode
 
 
 def test_same_account_device_handoff_counts_only_new_session(rig):
