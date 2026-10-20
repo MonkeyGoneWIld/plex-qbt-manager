@@ -106,6 +106,7 @@ All settings are Docker environment variables.
 | `MAX_UPLOAD_MIB` | `12` | Maximum upload budget in MiB/s while dynamic control is active. |
 | `MIN_UPLOAD_MIB` | `1` | Lowest upload limit the manager may apply. |
 | `BANDWIDTH_MULTIPLIER` | `1` | Multiplies the Plex bandwidth reservation. Use a value above 1 for extra headroom. |
+| `UPLOAD_STEP_MIB` | `0.25` | Least change of the upload limit worth writing to qBittorrent while alternative speeds stay on. A stream's measured bitrate drifts a little all the time; smaller moves are left alone so the Web UI isn't asked every few seconds. A stream starting or stopping is written at once. `0` writes every change. |
 | `POLLING_INTERVAL` | `5` | Seconds between Plex checks. |
 | `DEBOUNCE_SECONDS` | `3` | Delay before applying a less restrictive limit. More restrictive changes apply immediately. |
 | `STOP_DELAY_SECONDS` | `30` | Seconds to retain bandwidth after a stream stops or disappears. |

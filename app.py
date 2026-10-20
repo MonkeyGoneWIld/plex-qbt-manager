@@ -55,6 +55,8 @@ class Config:
     max_upload_mib: Decimal = field(default_factory=lambda: os.getenv('MAX_UPLOAD_MIB', '12'))
     min_upload_mib: Decimal = field(default_factory=lambda: os.getenv('MIN_UPLOAD_MIB', '1'))
     bandwidth_multiplier: Decimal = field(default_factory=lambda: os.getenv('BANDWIDTH_MULTIPLIER', '1'))
+    # The least change of the upload limit worth writing, while alternative speeds stay on.
+    upload_step_mib: Decimal = field(default_factory=lambda: os.getenv('UPLOAD_STEP_MIB', '0.25'))
     plex_stale_seconds: int = field(default_factory=lambda: os.getenv('PLEX_STALE_SECONDS', '120'))
     theater_url: str = field(default_factory=lambda: os.getenv('THEATER_URL', ''))
     theater_api_key: str = field(default_factory=lambda: os.getenv('THEATER_API_KEY', ''))
@@ -220,10 +222,10 @@ def main():
         logger.error(f"Missing required environment variables: {', '.join(missing)}")
         sys.exit(1)
 
-    logger.info('Starting dynamic=%s min_mib=%s max_mib=%s multiplier=%s poll=%ss '
+    logger.info('Starting dynamic=%s min_mib=%s max_mib=%s multiplier=%s step_mib=%s poll=%ss '
                 'pause=%ss stop=%ss debounce=%ss drift=%ss stale=%ss Plex_timeout=%ss qbt_timeout=%ss',
                 config.dynamic_upload_enabled, config.min_upload_mib, config.max_upload_mib,
-                config.bandwidth_multiplier, config.polling_interval, config.pause_buffer_delay_seconds,
+                config.bandwidth_multiplier, config.upload_step_mib, config.polling_interval, config.pause_buffer_delay_seconds,
                 config.stop_delay_seconds, config.debounce_seconds, config.drift_check_seconds,
                 config.plex_stale_seconds, config.plex_timeout, config.qbt_timeout)
     state = StateManager(config)
