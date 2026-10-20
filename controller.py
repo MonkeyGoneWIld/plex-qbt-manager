@@ -68,11 +68,6 @@ def validate_config(cfg):
             raise ValueError(f'THEATER_URL{suffix} repeats another Theater instance')
         endpoints.add(endpoint)
         cfg.theaters.append({'name': name, 'url': theater_url, 'api_key': api_key})
-    step = decimal_value(getattr(cfg, 'upload_step_mib', '0'), 'UPLOAD_STEP_MIB')
-    if step < 0:
-        raise ValueError('UPLOAD_STEP_MIB must be zero or more')
-    cfg.upload_step_mib = step
-    cfg.upload_step_bps = int(step * MIB)
     if cfg.min_upload_mib > cfg.max_upload_mib:
         raise ValueError('MIN_UPLOAD_MIB must not exceed MAX_UPLOAD_MIB')
     cfg.min_upload_bps = int((cfg.min_upload_mib * MIB).to_integral_value(rounding=ROUND_CEILING))
@@ -518,10 +513,7 @@ class StateManager:
                 previous = tracked.playback
                 if obs.bandwidth_kbps is not None and (active or tracked.bandwidth_kbps is None):
                     if tracked.bandwidth_kbps != obs.bandwidth_kbps:
-                        # A measured stream moves by a few kbps every poll: only a real change is news.
-                        was = tracked.bandwidth_kbps
-                        big = was is None or abs(obs.bandwidth_kbps - was) >= max(1, was) * Decimal('0.1')
-                        (logger.info if big else logger.debug)('Session=%r bandwidth_kbps %s -> %s (%s reservation)',
+                        logger.info('Session=%r bandwidth_kbps %s -> %s (%s reservation)',
                                     key, tracked.bandwidth_kbps, obs.bandwidth_kbps,
                                     'Plex' if obs.bandwidth_source == 'plex_session' else 'Theater')
                     tracked.bandwidth_kbps = obs.bandwidth_kbps
@@ -594,17 +586,8 @@ class StateManager:
                 want = not self.stale and any(s.bandwidth_kbps is not None for s in self.sessions.values())
                 calculated = upload_budget(self.cfg, total) if want and self.cfg.dynamic_upload_enabled else None
                 limit = qbt_budget(self.cfg, calculated) if calculated is not None else None
-                # A small move isn't worth a write. A measured stream's bitrate drifts by a few kbps
-                # from poll to poll, and each change is four requests to qBittorrent, whose Web UI
-                # is often the slowest thing here: on 20 October it timed out 28 times in 40 minutes
-                # while the limit moved by 0.01 MiB/s every few seconds. Measured from the limit
-                # last decided, so a slow drift still gets written once it adds up.
-                held = self.desired_upload_bps
-                if (want and self.desired_mode and limit is not None and held is not None
-                        and abs(limit - held) < getattr(self.cfg, 'upload_step_bps', 0)):
-                    limit = held
                 self.calculated_upload_bps = calculated
-                decision = (want, limit, unknown, len(self.sessions))
+                decision = (want, limit, total, unknown, len(self.sessions))
                 log = logger.info if decision != self.last_decision else logger.debug
                 log('cycle=%s budget sessions=%s reserved_mbps=%.3f multiplier=%s unknown=%s '
                     'min_mib=%s max_mib=%s calculated_bps=%s target_bps=%s target_mib=%s alt=%s',

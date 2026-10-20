@@ -18,7 +18,7 @@ when streaming stops, qBittorrent returns to its normal speed settings.
 - Integrates with
   [Plex Discord Theater](https://github.com/MonkeyGoneWIld/plex-discord-theater)
   for viewer-aware bandwidth estimates, including several Theater instances at once
-  and the bandwidth Theater's ffmpeg engine measures.
+  and the bandwidth Theater gives for its ffmpeg engine's streams and its copies.
 - Runs as a lightweight Docker container on AMD64 and ARM64.
 
 No Tautulli, Tracearr, browser extension, or additional Plex account is needed.
@@ -106,7 +106,6 @@ All settings are Docker environment variables.
 | `MAX_UPLOAD_MIB` | `12` | Maximum upload budget in MiB/s while dynamic control is active. |
 | `MIN_UPLOAD_MIB` | `1` | Lowest upload limit the manager may apply. |
 | `BANDWIDTH_MULTIPLIER` | `1` | Multiplies the Plex bandwidth reservation. Use a value above 1 for extra headroom. |
-| `UPLOAD_STEP_MIB` | `0.25` | Least change of the upload limit worth writing to qBittorrent while alternative speeds stay on. A stream's measured bitrate drifts a little all the time; smaller moves are left alone so the Web UI isn't asked every few seconds. A stream starting or stopping is written at once. `0` writes every change. |
 | `POLLING_INTERVAL` | `5` | Seconds between Plex checks. |
 | `DEBOUNCE_SECONDS` | `3` | Delay before applying a less restrictive limit. More restrictive changes apply immediately. |
 | `STOP_DELAY_SECONDS` | `30` | Seconds to retain bandwidth after a stream stops or disappears. |
@@ -170,8 +169,8 @@ streams are added together.
 
 With Theater's `PLAYBACK_ENGINE=ffmpeg`, Theater makes streams from the file
 itself, so Plex has no bandwidth for them. Theater reports what one viewer of
-each such stream downloads instead: measured from the segments ffmpeg has
-already made, or the stream's target bitrate just after it starts or seeks.
+each such stream downloads instead, one figure for the whole stream as Plex
+gives one for its own: a copy's file average, a re-encode's target bitrate.
 The manager uses that figure in place of Plex's:
 
 ```text
@@ -191,10 +190,11 @@ A Theater build whose ffmpeg engine does not report bandwidth gives the manager
 nothing to match those streams with, so they count as nothing while they play.
 Streams played through Plex are unaffected either way.
 
-Theater also sends `bandwidth_kbps` for the Direct Stream copies it measures
-from Plex. Plex's own figure for a copy is how fast it hands the segments to
-Theater over the LAN (121 Mbps for a 1 to 5 Mbps film, in one case), so the
-manager reserves Theater's figure instead, and still claims Plex's session.
+Theater also sends `bandwidth_kbps` for its Direct Stream copies from Plex:
+the file's average. Plex's own figure for a copy is how fast it hands the
+segments to Theater over the LAN (121 Mbps for a 1 to 5 Mbps film, in one
+case), so the manager reserves Theater's figure instead, and still claims
+Plex's session.
 
 In `GET /status`, a Theater session's `bandwidth_kbps` is its reservation after
 viewer weighting, and its `bandwidth_source` is `theater_snapshot` for an ffmpeg

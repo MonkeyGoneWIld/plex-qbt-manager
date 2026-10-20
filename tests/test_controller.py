@@ -164,39 +164,6 @@ def test_unknown_bandwidth_beside_a_known_one_counts_nothing(rig):
     assert rig.q.prefs['alt_up_limit'] == qbt_budget(rig.m.cfg, upload_budget(rig.m.cfg, 5000))
 
 
-def test_small_moves_of_the_limit_are_not_written(rig):
-    writes = lambda: [c for c in rig.q.calls if c[0] == 'set_prefs']
-    rig.poll(0, xml_session(bandwidth='12000'))
-    first = rig.q.prefs['alt_up_limit']
-    assert rig.q.mode and len(writes()) == 1
-    # 0.1 Mbps more: 0.01 MiB/s off the limit, under UPLOAD_STEP_MIB (0.25): nothing written.
-    rig.poll(10, xml_session(bandwidth='12100'))
-    rig.poll(20, xml_session(bandwidth='11950'))
-    assert len(writes()) == 1 and rig.q.prefs['alt_up_limit'] == first
-    # Drift that adds up past the step, measured from the limit last written, is written.
-    rig.poll(30, xml_session(bandwidth='14500'))
-    assert len(writes()) == 2
-    assert rig.q.prefs['alt_up_limit'] == qbt_budget(rig.m.cfg, upload_budget(rig.m.cfg, 14500))
-    # A stream starting is a real change, written at once.
-    rig.poll(40, xml_session(bandwidth='14500'), xml_session('2', bandwidth='5000', player='player-2'))
-    assert len(writes()) == 3
-    assert rig.q.prefs['alt_up_limit'] == qbt_budget(rig.m.cfg, upload_budget(rig.m.cfg, 19500))
-
-
-def test_upload_step_zero_writes_every_change(rig):
-    rig.m.cfg.upload_step_bps = 0
-    writes = lambda: [c for c in rig.q.calls if c[0] == 'set_prefs']
-    rig.poll(0, xml_session(bandwidth='12000'))
-    rig.poll(10, xml_session(bandwidth='12100'))
-    assert len(writes()) == 2
-
-
-@pytest.mark.parametrize('value', ['-0.1', 'NaN', 'bad'])
-def test_upload_step_validation(value):
-    with pytest.raises(ValueError, match='UPLOAD_STEP_MIB'):
-        app.Config(upload_step_mib=value)
-
-
 def test_sum_dedup_and_token_endpoint(rig):
     rig.poll(0, xml_session(), xml_session(), xml_session('2', bandwidth='5000'),
              xml_session('3', bandwidth='15000'), xml_session('4', local='1', bandwidth='500000'))
