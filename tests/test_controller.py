@@ -1,6 +1,7 @@
 import json
 import logging
 import threading
+import time
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -475,6 +476,45 @@ def test_status_does_not_block_on_qbt_io(rig):
         release.set()
         worker.join(timeout=3)
     assert not worker.is_alive()
+
+
+def test_stuck_qbittorrent_never_holds_up_seeing_a_new_stream(rig):
+    rig.poll(0, xml_session())
+    entered, release = threading.Event(), threading.Event()
+
+    class StuckQbt(FakeQbt):
+        @property
+        def speed_limits_mode(self):
+            entered.set()
+            assert release.wait(5)
+            return super().speed_limits_mode
+
+    stuck = StuckQbt()
+    stuck.mode, stuck.prefs = rig.q.mode, dict(rig.q.prefs)
+    rig.m.qbt = stuck
+    rig.m.start_worker()
+    try:
+        # A drift check falls due and qBittorrent stops answering it, as on 21 October.
+        rig.poll(60, xml_session())
+        assert entered.wait(2)
+        started = time.monotonic()
+        rig.poll(61, xml_session(), xml_session('2', bandwidth='5000', player='phone'))
+        assert time.monotonic() - started < 1
+        expected = qbt_budget(rig.m.cfg, upload_budget(rig.m.cfg, 17000))
+        assert rig.m.status()['desired_upload_bps'] == expected
+        release.set()
+        deadline = time.monotonic() + 3
+        while stuck.prefs['alt_up_limit'] != expected and time.monotonic() < deadline:
+            time.sleep(0.01)
+        # The drift check's reads, then straight to the new stream's cap.
+        assert stuck.calls[:3] == [('read_mode',), ('read_prefs',), ('set_prefs', {'alt_up_limit': expected})]
+        assert stuck.prefs['alt_up_limit'] == expected and stuck.mode
+    finally:
+        rig.m.shutdown = True
+        release.set()
+        rig.m.qbt_wake.set()
+        rig.m.worker.join(timeout=3)
+    assert not rig.m.worker.is_alive()
 
 
 def test_invalid_json_and_oversized_webhooks(rig, monkeypatch):

@@ -100,6 +100,11 @@ def test_real_clients_use_token_and_bytes(api_server, multiplier, expected):
     assert session_requests and session_requests[0]['X-Plex-Token'] == 'test-plex-token'
     writes = [body for method, path, body in data.requests if path == '/api/v2/app/setPreferences']
     assert json.loads(writes[0]['json'][0]) == {'alt_up_limit': expected}
+    # After logging in, the cap goes out first; the Web API version is asked once, not per change.
+    assert [(method, path) for method, path, _ in data.requests if path.startswith('/api/v2/')] == [
+        ('POST', '/api/v2/auth/login'), ('GET', '/api/v2/app/version'), ('GET', '/api/v2/app/webapiVersion'),
+        ('POST', '/api/v2/app/setPreferences'), ('GET', '/api/v2/app/preferences'),
+        ('POST', '/api/v2/transfer/setSpeedLimitsMode'), ('GET', '/api/v2/transfer/speedLimitsMode')]
     # Exact readback + whole-KiB values prevent endless retry loops.
     requests = len(data.requests)
     now[0] = 5

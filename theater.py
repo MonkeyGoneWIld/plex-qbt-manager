@@ -110,12 +110,14 @@ class Theater:
         self.uncertain = False
         self.server_mismatch = False
         self.ignored = False
+        # Set by a Plex webhook: poll ahead of the interval, though not twice in a second.
+        self.due = False
 
     def poll(self):
         now = self.clock()
-        if now - self.attempted < self.cfg.theater_poll_interval_seconds:
+        if now - self.attempted < (1 if self.due else self.cfg.theater_poll_interval_seconds):
             return
-        self.attempted = now
+        self.attempted, self.due = now, False
         try:
             request = Request(self.url.rstrip('/') + '/api/integrations/qbt-manager/state',
                               headers={'Authorization': 'Bearer ' + self.api_key,

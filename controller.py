@@ -89,6 +89,22 @@ def qbt_budget(cfg, calculated_bps):
     return max((cfg.min_upload_bps + 1023) // 1024, calculated_bps // 1024) * 1024
 
 
+def protects(want, limit, mode, mode_limit):
+    """Whether the decision is stricter than qBittorrent's alternative mode and limit."""
+    return want and (not mode or (limit is not None and (mode_limit is None or mode_limit <= 0 or limit < mode_limit)))
+
+
+class QbtClient(QBittorrentClient):
+    # qbittorrent-api asks for the Web API version before every set_speed_limits_mode:
+    # one more request, before the cap, to a qBittorrent that is often slow to answer.
+    _web_api_version = None
+
+    def app_web_api_version(self, **kwargs):
+        if self._web_api_version is None:
+            self._web_api_version = super().app_web_api_version(**kwargs)
+        return self._web_api_version
+
+
 @dataclass
 class Observation:
     key: str
@@ -187,6 +203,11 @@ class StateManager:
         self.lock = threading.RLock()
         self.refresh_lock = threading.Lock()
         self.wake = threading.Event()
+        # qBittorrent is written apart from polling once start_worker runs (see apply).
+        self.apply_lock = threading.Lock()
+        self.qbt_wake = threading.Event()
+        self.worker = None
+        self.holding = False
         self.hints = deque(maxlen=256)
         self.shutdown = False
         self.plex = self.qbt = None
@@ -226,14 +247,14 @@ class StateManager:
         return plex
 
     def _open_qbt(self):
-        qbt = QBittorrentClient(host=self.cfg.qbt_url, username=self.cfg.qbt_username,
-                               password=self.cfg.qbt_password,
-                               REQUESTS_ARGS={'timeout': (3.05, self.cfg.qbt_timeout)},
-                               # A reused idle connection can be dropped silently on the way to
-                               # qBittorrent, stalling a request for the whole read timeout.
-                               EXTRA_HEADERS={'Connection': 'close'})
+        qbt = QbtClient(host=self.cfg.qbt_url, username=self.cfg.qbt_username,
+                        password=self.cfg.qbt_password,
+                        REQUESTS_ARGS={'timeout': (3.05, self.cfg.qbt_timeout)},
+                        # A reused idle connection can be dropped silently on the way to
+                        # qBittorrent, stalling a request for the whole read timeout.
+                        EXTRA_HEADERS={'Connection': 'close'})
         qbt.auth_log_in()
-        logger.info('qBittorrent connected version=%s', qbt.app.version)
+        logger.info('qBittorrent connected version=%s web_api=%s', qbt.app.version, qbt.app_web_api_version())
         return qbt
 
     def _connect(self):
@@ -255,6 +276,10 @@ class StateManager:
                 logger.debug('Queued resume hint player=%r rating_key=%r', hint.player_id, hint.rating_key)
             else:
                 logger.debug('Webhook has insufficient identity for a resume hint; polling only')
+        # Plex's play webhook for a Theater stream comes a second or two after it starts;
+        # ask the Theaters then rather than at their next interval.
+        for theater in self.theaters:
+            theater.due = True
         self.wake.set()
 
     def _resumed_keys(self, observations, now):
@@ -563,8 +588,10 @@ class StateManager:
                 logger.debug('cycle=%s holding decision mode=%s upload_bps=%s Plex_age_seconds=%.1f',
                              self.cycle, want, limit, age)
                 # Freeze actual qBittorrent settings, including pending writes/drift repair.
+                self.holding = True
                 return
             else:
+                self.holding = False
                 if not fresh:
                     if not self.stale:
                         logger.error('Plex data stale age=%.1fs timeout=%ss; disabling alternative speeds; upload preference unchanged', age, self.cfg.plex_stale_seconds)
@@ -598,11 +625,39 @@ class StateManager:
                 self.desired_mode, self.desired_upload_bps = want, limit
             for key, tracked in self.sessions.items():
                 logger.debug('cycle=%s session=%r snapshot=%s', self.cycle, key, tracked.snapshot(now))
-        if want is not None:
-            self._reconcile(want, limit, force=self.stale)
+        if self.worker is None:
+            self.apply()
+        else:
+            self.qbt_wake.set()
+
+    def start_worker(self):
+        """From now on write qBittorrent on a thread of its own, so polling never waits on it.
+
+        On 21 October a drift check stuck on a busy qBittorrent held the one loop for 34 s,
+        and a Theater stream that started meanwhile went unseen, and uncapped, all that time.
+        """
+        def run():
+            while not self.shutdown:
+                self.qbt_wake.wait(timeout=self.cfg.polling_interval)
+                # Cleared before apply reads the decision, so a newer one gets another pass.
+                self.qbt_wake.clear()
+                try:
+                    self.apply()
+                except Exception:
+                    logger.exception('Unexpected qBittorrent failure; retry next cycle')
+        self.worker = threading.Thread(target=run, name='qbittorrent', daemon=True)
+        self.worker.start()
+
+    def apply(self):
+        with self.apply_lock:
+            with self.lock:
+                if self.holding or self.desired_mode is None:
+                    return
+                want, limit, force = self.desired_mode, self.desired_upload_bps, self.stale
+            self._reconcile(want, limit, force=force)
 
     def _reconcile(self, want, limit, force=False):
-        # Serialised by refresh_lock; network I/O never holds the status lock.
+        # Serialised by apply_lock; network I/O never holds the status lock.
         now = self.clock()
         due = now - self.last_drift_check >= self.cfg.drift_check_seconds
         if (not self.retry_qbt and not due and want == self.alt_speeds
@@ -614,21 +669,29 @@ class StateManager:
         try:
             if self.qbt is None:
                 self.qbt = self._open_qbt()
-            action = 'read'
-            actual = bool(int(self.qbt.transfer.speed_limits_mode))
-            actual_limit = int(self.qbt.app.preferences['alt_up_limit']) if limit is not None else None
-            logger.debug('cycle=%s qBittorrent read mode=%s alt_upload_bps=%s desired_mode=%s desired_bps=%s',
-                         self.cycle, actual, actual_limit, want, limit)
-            if self.alt_speeds is not None and actual != self.alt_speeds:
-                logger.warning('qBittorrent mode changed externally expected=%s actual=%s', self.alt_speeds, actual)
-            if actual_limit is not None and self.applied_upload_bps is not None and actual_limit != self.applied_upload_bps:
-                logger.warning('qBittorrent upload changed externally expected_bps=%s actual_bps=%s', self.applied_upload_bps, actual_limit)
-            with self.lock:
-                self.alt_speeds = actual
-                if actual_limit is not None:
-                    self.applied_upload_bps = actual_limit
+            # Stricter than qBittorrent was last seen: the limit, then the mode, go out before
+            # anything is read, and are read back after. A busy qBittorrent stalls its Web UI for
+            # seconds at a time, every connection at once (10 to 14 s on 21 October), and the
+            # reads ahead of the writes then left a stream's first segments uncapped for up to 21 s.
+            tighten = protects(want, limit, self.alt_speeds, self.applied_upload_bps)
+            if tighten:
+                actual, actual_limit = self.alt_speeds, self.applied_upload_bps
+            else:
+                action = 'read'
+                actual = bool(int(self.qbt.transfer.speed_limits_mode))
+                actual_limit = int(self.qbt.app.preferences['alt_up_limit']) if limit is not None else None
+                logger.debug('cycle=%s qBittorrent read mode=%s alt_upload_bps=%s desired_mode=%s desired_bps=%s',
+                             self.cycle, actual, actual_limit, want, limit)
+                if self.alt_speeds is not None and actual != self.alt_speeds:
+                    logger.warning('qBittorrent mode changed externally expected=%s actual=%s', self.alt_speeds, actual)
+                if actual_limit is not None and self.applied_upload_bps is not None and actual_limit != self.applied_upload_bps:
+                    logger.warning('qBittorrent upload changed externally expected_bps=%s actual_bps=%s', self.applied_upload_bps, actual_limit)
+                with self.lock:
+                    self.alt_speeds = actual
+                    if actual_limit is not None:
+                        self.applied_upload_bps = actual_limit
             change = actual != want or (limit is not None and actual_limit != limit)
-            protective = want and (not actual or (limit is not None and (actual_limit <= 0 or limit < actual_limit)))
+            protective = protects(want, limit, actual, actual_limit)
             if change and not protective and not force and now - self.last_change < self.cfg.debounce_seconds:
                 logger.debug('qBittorrent relaxation debounced remaining=%.2fs', self.cfg.debounce_seconds - (now - self.last_change))
                 self.retry_qbt = True
@@ -642,6 +705,14 @@ class StateManager:
                     raise RuntimeError(f'upload readback mismatch requested={limit} actual={verified}')
                 with self.lock:
                     self.applied_upload_bps = verified
+            if tighten and actual == want:
+                # On when last seen; with the cap out, check that it still is.
+                action = 'read'
+                actual = bool(int(self.qbt.transfer.speed_limits_mode))
+                if actual != want:
+                    logger.warning('qBittorrent mode changed externally expected=%s actual=%s', want, actual)
+                    with self.lock:
+                        self.alt_speeds = actual
             if actual != want:
                 action = 'set mode'
                 self.qbt.transfer.set_speed_limits_mode(intended_state=want)

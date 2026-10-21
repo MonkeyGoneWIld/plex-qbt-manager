@@ -236,11 +236,13 @@ def main():
         logger.info(f"Signal {signum} received, shutting down")
         state.shutdown = True
         state.wake.set()  # break the poll loop out of its wait immediately
+        state.qbt_wake.set()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
+    state.start_worker()
     threading.Thread(target=polling_loop, daemon=True).start()
 
     logger.info(f"Listening on port {config.http_port} (remote Plex sessions only)")

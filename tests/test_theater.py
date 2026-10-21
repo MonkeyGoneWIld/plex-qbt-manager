@@ -484,6 +484,39 @@ def test_ffmpeg_stream_without_plex_row_reserves_theater_bandwidth(rig, monkeypa
     assert rig.q.prefs['alt_up_limit'] == qbt_budget(rig.m.cfg, upload_budget(rig.m.cfg, kbps))
 
 
+@pytest.mark.parametrize('viewers', [1, 2, 7])
+def test_ffmpeg_stream_reserves_a_copy_per_viewer(rig, monkeypatch, viewers):
+    # Viewers are worldwide, not on one network: each pulls its own copy over the upload.
+    t = enable(rig, monkeypatch, ffmpeg(viewers=viewers, kbps=4000))
+    rig.m.cfg.theater_bandwidth_factor = Decimal(1)
+    rig.poll(0)
+    assert rig.m.status()['reserved_bandwidth_mbps'] == 4 * viewers
+    assert rig.q.prefs['alt_up_limit'] == qbt_budget(rig.m.cfg, upload_budget(rig.m.cfg, 4000 * viewers))
+    # One more joining is a tighter cap on the next poll, written before anything is read.
+    rig.q.calls.clear()
+    t.snapshot, t.received = snapshot(ffmpeg(viewers=viewers + 1, kbps=4000), sequence=2), 1
+    rig.poll(1)
+    expected = qbt_budget(rig.m.cfg, upload_budget(rig.m.cfg, 4000 * (viewers + 1)))
+    assert rig.q.calls[0] == ('set_prefs', {'alt_up_limit': expected})
+    assert rig.q.prefs['alt_up_limit'] == expected
+
+
+def test_new_ffmpeg_stream_is_capped_on_the_first_poll_that_sees_it(rig, monkeypatch):
+    t = enable(rig, monkeypatch)
+    rig.poll(0)
+    assert not rig.q.mode
+    rig.q.calls.clear()
+    # Plex lists nothing for it yet: the reporter's row comes a second or two later.
+    t.snapshot, t.received = snapshot(ffmpeg(viewers=2, kbps=8000), sequence=2), 1
+    rig.poll(1)
+    expected = qbt_budget(rig.m.cfg, upload_budget(rig.m.cfg, 12800))  # 8 Mbps × 2 viewers × 0.8
+    assert rig.q.mode and rig.q.prefs['alt_up_limit'] == expected
+    # The limit, its readback (never alternative mode on an unverified limit), then the mode:
+    # nothing is read before the cap is out.
+    assert rig.q.calls == [('set_prefs', {'alt_up_limit': expected}), ('read_prefs',),
+                           ('set_mode', True), ('read_mode',)]
+
+
 def test_ffmpeg_reporter_rows_are_claimed_once_and_keep_theater_bandwidth(rig, monkeypatch):
     client = 'plex-discord-theater-hls-1'
     t = enable(rig, monkeypatch, ffmpeg(viewers=2, client=client))

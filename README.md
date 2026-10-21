@@ -91,6 +91,10 @@ The manager changes the alternative upload value. Your normal qBittorrent upload
 and download limits, plus the alternative download limit, remain under
 qBittorrent's control.
 
+qBittorrent is written from a thread of its own, so a slow qBittorrent Web UI
+never delays the next Plex or Theater check. A stricter limit goes out before
+anything is read from qBittorrent, and is read back after.
+
 ## Configuration
 
 All settings are Docker environment variables.
@@ -160,7 +164,7 @@ streams are added together.
 | `THEATER_URL` | Empty | Theater URL reachable from the manager. Empty disables the integration. |
 | `THEATER_API_KEY` | Empty | Shared secret matching Theater's `QBT_MANAGER_API_KEY`. |
 | `THEATER_BANDWIDTH_FACTOR` | `1` | Per-viewer estimate used when a variant has at least two viewers. |
-| `THEATER_POLL_INTERVAL_SECONDS` | `5` | Minimum seconds between Theater API checks. |
+| `THEATER_POLL_INTERVAL_SECONDS` | `5` | Minimum seconds between Theater API checks. A Plex playback webhook brings the next check forward, at most once a second. Use `1`, with `POLLING_INTERVAL` at `1`, to see a new Theater stream within about a second. |
 | `THEATER_TIMEOUT_SECONDS` | `3` | Timeout for a Theater API request. |
 | `THEATER_STALE_SECONDS` | `30` | Seconds an unreachable Theater's last data keeps counting. After that, the instance is ignored until it answers again. |
 | `THEATER_URL_2`, `THEATER_API_KEY_2`, ... | Empty | Additional Theater instances. See below. |

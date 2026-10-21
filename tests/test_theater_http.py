@@ -3,6 +3,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from app import Config
+from controller import StateManager
 from theater import Theater
 from test_controller import Clock
 from test_theater import snapshot, stream
@@ -62,6 +63,52 @@ def test_authenticated_http_poll_sequence_restart_and_failure_retention():
         clock.now = 30
         theater.poll()
         assert theater.error == 'HTTPError' and theater.received == 15
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_plex_webhook_polls_theater_ahead_of_its_interval(monkeypatch):
+    calls = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            calls.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps(snapshot(stream(), sequence=len(calls))).encode())
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        monkeypatch.setattr(StateManager, '_connect', lambda self: None)
+        clock = Clock()
+        manager = StateManager(Config(theater_url=f'http://127.0.0.1:{server.server_port}',
+                                      theater_api_key='test-secret', theater_poll_interval_seconds=3), clock=clock)
+        theater = manager.theaters[0]
+        theater.poll()
+        clock.now = 1
+        theater.poll()
+        assert len(calls) == 1
+        manager.poke({'event': 'media.play'})
+        theater.poll()
+        assert len(calls) == 2 and theater.received == 1
+        # Not twice in a second, but the poll it asked for still comes a second on.
+        clock.now = 1.5
+        manager.poke({'event': 'media.play'})
+        theater.poll()
+        assert len(calls) == 2
+        clock.now = 2
+        theater.poll()
+        assert len(calls) == 3
+        clock.now = 3
+        theater.poll()
+        assert len(calls) == 3
     finally:
         server.shutdown()
         server.server_close()
