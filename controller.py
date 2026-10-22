@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 from theater import Theater, overlay_all
 
 from plexapi.server import PlexServer
-from qbittorrentapi import Client as QBittorrentClient
+from qbittorrentapi import Client as QBittorrentClient, Forbidden403Error, LoginFailed, Unauthorized401Error
 
 logger = logging.getLogger('plex-qbt')
 MIB = 1024 ** 2
@@ -271,9 +271,18 @@ class StateManager:
                         # A reused idle connection can be dropped silently on the way to
                         # qBittorrent, stalling a request for the whole read timeout.
                         EXTRA_HEADERS={'Connection': 'close'})
-        qbt.auth_log_in()
+        if 'api_key' in login:
+            # qbittorrent-api checks a key with is_logged_in, which reports any failure, a
+            # timeout included, as LoginFailed. Asking for the version keeps a timeout a timeout.
+            try:
+                version = qbt.app_version()
+            except (Forbidden403Error, Unauthorized401Error) as exc:
+                raise LoginFailed('qBittorrent refused QBITTORRENT_API_KEY') from exc
+        else:
+            qbt.auth_log_in()
+            version = qbt.app.version
         logger.info('qBittorrent connected via=%s version=%s web_api=%s',
-                    via, qbt.app.version, qbt.app_web_api_version())
+                    via, version, qbt.app_web_api_version())
         return qbt
 
     def _connect(self):

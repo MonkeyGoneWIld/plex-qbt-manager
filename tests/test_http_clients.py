@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+from qbittorrentapi import APIConnectionError, LoginFailed
 from app import Config
 from controller import StateManager
 
@@ -13,7 +14,7 @@ from controller import StateManager
 @pytest.fixture
 def api_server():
     data = SimpleNamespace(mode=0, prefs={'alt_up_limit': 1024, 'alt_dl_limit': 2048, 'up_limit': 0},
-                           requests=[], seen=[], active=True, api_key=None)
+                           requests=[], seen=[], active=True, api_key=None, drop=False)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -29,6 +30,10 @@ def api_server():
                     self.send_error(401)
                     return None
                 return '/' + path
+            if path.startswith('/api/v2/') and data.drop:
+                # A stalled qBittorrent: the connection ends without an answer.
+                self.close_connection = True
+                return None
             if path.startswith('/api/v2/') and data.api_key and self.headers.get('Authorization') != f'Bearer {data.api_key}':
                 self.send_error(403)
                 return None
@@ -80,9 +85,6 @@ def api_server():
             data.requests.append(('POST', path, body))
             if path == '/api/v2/auth/login':
                 self.reply('Ok.', headers={'Set-Cookie': 'SID=test-session; Path=/'})
-            elif path == '/api/v2/app/version':
-                # qbittorrent-api checks an API key by posting here.
-                self.reply('v5.2.0')
             elif path == '/api/v2/app/setPreferences':
                 changes = json.loads(body['json'][0])
                 # qBittorrent v4 stores speed limits as whole KiB/s internally.
@@ -162,13 +164,28 @@ def test_qbittorrent_without_a_password(api_server, login):
     calls = [(method, path, auth) for method, path, auth in data.seen if '/api/v2/' in path]
     if login == 'api_key':
         # The key goes on every request in place of a login.
-        assert calls[0][:2] == ('POST', '/api/v2/app/version')
+        assert calls[0][:2] == ('GET', '/api/v2/app/version')
         assert all(auth == 'Bearer qbt_test-key' for _, _, auth in calls)
         assert not any(path.endswith('/auth/login') for _, path, _ in calls)
     else:
         # qui holds the qBittorrent login; the manager's own is a formality to qui.
         assert calls[0][:2] == ('POST', '/proxy/test-qui-key/api/v2/auth/login')
         assert all(path.startswith('/proxy/test-qui-key/api/v2/') and auth is None for _, path, auth in calls)
+
+
+def test_api_key_tells_a_stalled_qbittorrent_from_a_refused_key(api_server):
+    url, data = api_server
+    data.api_key = 'qbt_test-key'
+    manager = StateManager(Config(plex_url=url, plex_token='test-plex-token', qbt_url=url,
+                                  qbt_api_key='qbt_test-key'), clock=lambda: 0)
+    assert manager.qbt is not None
+    # qbittorrent-api's own key check reports both as LoginFailed.
+    data.drop = True
+    with pytest.raises(APIConnectionError):
+        manager._open_qbt()
+    data.drop, data.api_key = False, 'qbt_another-key'
+    with pytest.raises(LoginFailed, match='QBITTORRENT_API_KEY'):
+        manager._open_qbt()
 
 
 def test_qui_proxy_url_must_carry_a_client_key():
