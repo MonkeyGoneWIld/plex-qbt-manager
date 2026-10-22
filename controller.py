@@ -590,11 +590,15 @@ class StateManager:
                                 tracked.playback, tracked.remaining(now))
             for key, tracked in self.sessions.items():
                 if key not in observations and tracked.playback != 'missing':
-                    tracked.playback, tracked.since = 'missing', now
+                    # A stopped stream's grace is already running: Theater dropping the room
+                    # afterwards must not start a second one (60 s instead of 30 on 22 October).
+                    if tracked.playback != 'stopped' or tracked.since is None:
+                        tracked.since, tracked.delay = now, self.cfg.stop_delay_seconds
+                    tracked.playback = 'missing'
                     if tracked.bandwidth_kbps is not None:
                         tracked.bandwidth_source = 'last_known'
-                    tracked.delay = self.cfg.stop_delay_seconds
-                    logger.info('Session=%r missing; stop grace=%ss', key, tracked.delay)
+                    logger.info('Session=%r missing; stop grace=%ss grace_seconds=%s', key, tracked.delay,
+                                tracked.remaining(now))
         return True
 
     def refresh(self):

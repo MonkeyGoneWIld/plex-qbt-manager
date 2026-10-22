@@ -125,6 +125,23 @@ def test_viewer_count_updates_and_zero_viewers_stop_grace(rig, monkeypatch):
     assert not rig.q.mode
 
 
+def test_stopped_room_that_vanishes_keeps_its_stop_grace(rig, monkeypatch):
+    t = enable(rig, monkeypatch, stream())
+    rig.poll(0, plex())
+    t.snapshot = snapshot(stream(state='stopped', revision=2), sequence=2)
+    t.received = 10
+    rig.poll(10, plex())
+    # Theater drops the stopped room, and Plex its row, inside the stop grace.
+    t.snapshot = snapshot(sequence=3)
+    t.received = 25
+    rig.poll(25)
+    assert rig.m.status()['sessions']['theater:hls-1']['state'] == 'missing' and rig.q.mode
+    t.received = 40
+    rig.poll(40)
+    # Released 30 s after the stop, not 30 s after the room vanished.
+    assert not rig.q.mode and not rig.m.sessions
+
+
 def test_removed_room_does_not_recount_lingering_remote_plex(rig, monkeypatch):
     t = enable(rig, monkeypatch, stream(viewers=2))
     rig.poll(0, plex(local='0'))
