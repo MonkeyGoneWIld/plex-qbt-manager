@@ -260,8 +260,9 @@ class StateManager:
         elif self.cfg.qbt_api_key:
             via, login = 'API key', {'host': self.cfg.qbt_url, 'api_key': self.cfg.qbt_api_key}
         else:
-            via, login = 'password', {'host': self.cfg.qbt_url, 'username': self.cfg.qbt_username,
-                                      'password': self.cfg.qbt_password}
+            # Not 'password': the log redactor blanks whatever follows that word.
+            via, login = 'login', {'host': self.cfg.qbt_url, 'username': self.cfg.qbt_username,
+                                   'password': self.cfg.qbt_password}
         qbt = QbtClient(**login,
                         # Otherwise qbittorrent-api sends HEAD / first, and again after every failed
                         # request, to guess http or https. A stalled qBittorrent times it out (2 x 10 s

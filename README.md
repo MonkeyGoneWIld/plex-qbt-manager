@@ -83,7 +83,7 @@ The manager can reach qBittorrent in three ways. Pick one:
       QUI_PROXY_URL: "http://qui:7476/proxy/replace-with-your-qui-client-key"
 ```
 
-The startup log says which one is in use: `qBittorrent connected via=password`,
+The startup log says which one is in use: `qBittorrent connected via=login`,
 `via=API key` or `via=qui proxy`. The keys are redacted from the logs.
 
 Start the service:

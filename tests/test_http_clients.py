@@ -1,5 +1,6 @@
 """Exercise real PlexAPI/qbittorrent-api serialization over local HTTP."""
 import json
+import logging
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
@@ -7,7 +8,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from qbittorrentapi import APIConnectionError, LoginFailed
-from app import Config
+from app import Config, RedactingFormatter
 from controller import StateManager
 
 
@@ -111,13 +112,18 @@ def api_server():
 
 
 @pytest.mark.parametrize('multiplier,expected', [('1', 8582144), ('1.5', 6582272)])
-def test_real_clients_use_token_and_bytes(api_server, multiplier, expected):
+def test_real_clients_use_token_and_bytes(api_server, multiplier, expected, caplog):
     url, data = api_server
     now = [0]
+    caplog.set_level(logging.INFO, logger='plex-qbt')
     manager = StateManager(Config(plex_url=url, qbt_url=url, plex_token='test-plex-token',
                                  qbt_username='test-user', qbt_password='test-password',
                                  dynamic_upload_enabled=True, bandwidth_multiplier=multiplier),
                            clock=lambda: now[0])
+    # The version survives the redactor, which blanks whatever follows "password".
+    startup = [RedactingFormatter(manager.cfg).format(record) for record in caplog.records
+               if record.getMessage().startswith('qBittorrent connected')]
+    assert startup and startup[0].endswith('qBittorrent connected via=login version=v4.6.7 web_api=2.11.0')
     manager.refresh()
     assert data.mode == 1
     assert data.prefs == {'alt_up_limit': expected, 'alt_dl_limit': 2048, 'up_limit': 0}
