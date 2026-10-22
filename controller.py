@@ -68,6 +68,13 @@ def validate_config(cfg):
             raise ValueError(f'THEATER_URL{suffix} repeats another Theater instance')
         endpoints.add(endpoint)
         cfg.theaters.append({'name': name, 'url': theater_url, 'api_key': api_key})
+    cfg.qui_proxy_key = ''
+    if cfg.qui_proxy_url:
+        url = urlsplit(cfg.qui_proxy_url)
+        parts = url.path.rstrip('/').split('/')
+        if url.scheme not in ('http', 'https') or not url.hostname or parts[-2:-1] != ['proxy']:
+            raise ValueError('QUI_PROXY_URL must be the proxy URL qui gives a client API key: http://<qui>:7476/proxy/<key>')
+        cfg.qui_proxy_key = parts[-1]
     if cfg.min_upload_mib > cfg.max_upload_mib:
         raise ValueError('MIN_UPLOAD_MIB must not exceed MAX_UPLOAD_MIB')
     cfg.min_upload_bps = int((cfg.min_upload_mib * MIB).to_integral_value(rounding=ROUND_CEILING))
@@ -247,14 +254,22 @@ class StateManager:
         return plex
 
     def _open_qbt(self):
-        qbt = QbtClient(host=self.cfg.qbt_url, username=self.cfg.qbt_username,
-                        password=self.cfg.qbt_password,
+        if self.cfg.qui_proxy_url:
+            # qui holds the qBittorrent login: its auth/login answers Ok. for any client.
+            via, login = 'qui proxy', {'host': self.cfg.qui_proxy_url}
+        elif self.cfg.qbt_api_key:
+            via, login = 'API key', {'host': self.cfg.qbt_url, 'api_key': self.cfg.qbt_api_key}
+        else:
+            via, login = 'password', {'host': self.cfg.qbt_url, 'username': self.cfg.qbt_username,
+                                      'password': self.cfg.qbt_password}
+        qbt = QbtClient(**login,
                         REQUESTS_ARGS={'timeout': (3.05, self.cfg.qbt_timeout)},
                         # A reused idle connection can be dropped silently on the way to
                         # qBittorrent, stalling a request for the whole read timeout.
                         EXTRA_HEADERS={'Connection': 'close'})
         qbt.auth_log_in()
-        logger.info('qBittorrent connected version=%s web_api=%s', qbt.app.version, qbt.app_web_api_version())
+        logger.info('qBittorrent connected via=%s version=%s web_api=%s',
+                    via, qbt.app.version, qbt.app_web_api_version())
         return qbt
 
     def _connect(self):

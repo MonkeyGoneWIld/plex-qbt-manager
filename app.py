@@ -35,6 +35,11 @@ class Config:
     qbt_url: str = field(default_factory=lambda: os.getenv('QBITTORRENT_URL', 'http://qbittorrent:8080'))
     qbt_username: str = field(default_factory=lambda: os.getenv('QBITTORRENT_USERNAME', ''))
     qbt_password: str = field(default_factory=lambda: os.getenv('QBITTORRENT_PASSWORD', ''))
+    # A qBittorrent 5.2+ Web API key, sent in place of the username and password.
+    qbt_api_key: str = field(default_factory=lambda: os.getenv('QBITTORRENT_API_KEY', ''))
+    # qui's client proxy (http://qui:7476/proxy/<key>), used in place of QBITTORRENT_URL.
+    # qui holds the qBittorrent login, so no qBittorrent credentials are needed.
+    qui_proxy_url: str = field(default_factory=lambda: os.getenv('QUI_PROXY_URL', ''))
     polling_interval: int = field(default_factory=lambda: os.getenv('POLLING_INTERVAL', '5'))
     debounce_seconds: int = field(default_factory=lambda: os.getenv('DEBOUNCE_SECONDS', '3'))
     stop_delay_seconds: int = field(default_factory=lambda: os.getenv('STOP_DELAY_SECONDS', '30'))
@@ -77,7 +82,8 @@ class RedactingFormatter(logging.Formatter):
     def __init__(self, cfg):
         super().__init__('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         self.secrets = set()
-        for secret in (cfg.plex_token, cfg.qbt_password, cfg.theater_api_key, *(key for _, _, key in cfg.theater_extra)):
+        for secret in (cfg.plex_token, cfg.qbt_password, cfg.qbt_api_key, cfg.qui_proxy_key,
+                       cfg.theater_api_key, *(key for _, _, key in cfg.theater_extra)):
             if secret:
                 self.secrets.update((secret, quote(secret, safe=''), quote_plus(secret)))
 
@@ -207,12 +213,16 @@ def main():
         sys.exit(1)
     setup_logging(config)
 
+    # qui's proxy logs in to qBittorrent itself, and an API key replaces the login.
+    qbt_login = () if config.qui_proxy_url or config.qbt_api_key else (
+        ('QBITTORRENT_USERNAME', config.qbt_username),
+        ('QBITTORRENT_PASSWORD', config.qbt_password),
+    )
     missing = [
         name
         for name, value in (
             ('PLEX_TOKEN', config.plex_token),
-            ('QBITTORRENT_USERNAME', config.qbt_username),
-            ('QBITTORRENT_PASSWORD', config.qbt_password),
+            *qbt_login,
         )
         if not value
     ]

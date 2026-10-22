@@ -384,11 +384,14 @@ def test_webhook_is_nonblocking_and_health_reports_failures(rig, monkeypatch):
 
 
 def test_credentials_redacted_in_logs():
-    cfg = app.Config(plex_token='secret-token', qbt_password='pass / word')
+    cfg = app.Config(plex_token='secret-token', qbt_password='pass / word', qbt_api_key='qbt_secret-key',
+                     qui_proxy_url='http://qui:7476/proxy/qui-secret')
     record = logging.LogRecord('plex-qbt', logging.ERROR, '', 0,
-        'request secret-token pass / word pass%20%2F%20word http://user:pw@host X-Plex-Token=other-secret', (), None)
+        'request secret-token pass / word pass%20%2F%20word http://user:pw@host X-Plex-Token=other-secret '
+        'Bearer qbt_secret-key url: /proxy/qui-secret/api/v2/app/preferences', (), None)
     result = app.RedactingFormatter(cfg).format(record)
-    for secret in ('secret-token', 'pass / word', 'pass%20%2F%20word', 'user:pw', 'other-secret'):
+    for secret in ('secret-token', 'pass / word', 'pass%20%2F%20word', 'user:pw', 'other-secret',
+                   'qbt_secret-key', 'qui-secret'):
         assert secret not in result
 
 

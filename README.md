@@ -59,6 +59,33 @@ Use addresses that are reachable from inside the manager container. Container
 names such as `plex` and `qbittorrent` work when the services share a Docker
 network. Otherwise, use the server's LAN address.
 
+### Connecting to qBittorrent
+
+The manager can reach qBittorrent in three ways. Pick one:
+
+- **Username and password.** Set `QBITTORRENT_USERNAME` and `QBITTORRENT_PASSWORD`.
+- **qBittorrent API key** (qBittorrent 5.2 or later). Generate a key in the
+  qBittorrent Web UI (it starts with `qbt_`) and set it as `QBITTORRENT_API_KEY`.
+  The key replaces the username and password, which can be left out.
+- **qui's client proxy.** In [qui](https://github.com/autobrr/qui), open
+  **Settings → Client Proxy**, create a client API key for the qBittorrent
+  instance, and copy the proxy URL qui shows, such as
+  `http://qui:7476/proxy/<key>`. Set it as `QUI_PROXY_URL`. qui holds the
+  qBittorrent login, so `QBITTORRENT_URL` and the qBittorrent credentials are
+  not used. If something in front of qui asks for basic auth, turn it off for
+  the `/proxy/` path.
+
+```yaml
+      # either
+      QBITTORRENT_URL: "http://qbittorrent:8080"
+      QBITTORRENT_API_KEY: "qbt_replace-with-your-api-key"
+      # or
+      QUI_PROXY_URL: "http://qui:7476/proxy/replace-with-your-qui-client-key"
+```
+
+The startup log says which one is in use: `qBittorrent connected via=password`,
+`via=API key` or `via=qui proxy`. The keys are redacted from the logs.
+
 Start the service:
 
 ```bash
@@ -104,8 +131,10 @@ All settings are Docker environment variables.
 | `PLEX_URL` | `http://plex:32400` | Plex server URL reachable from the container. |
 | `PLEX_TOKEN` | Required | Plex authentication token. |
 | `QBITTORRENT_URL` | `http://qbittorrent:8080` | qBittorrent Web UI URL reachable from the container. |
-| `QBITTORRENT_USERNAME` | Required | qBittorrent Web UI username. |
-| `QBITTORRENT_PASSWORD` | Required | qBittorrent Web UI password. |
+| `QBITTORRENT_USERNAME` | Required | qBittorrent Web UI username. Not needed with `QBITTORRENT_API_KEY` or `QUI_PROXY_URL`. |
+| `QBITTORRENT_PASSWORD` | Required | qBittorrent Web UI password. Not needed with `QBITTORRENT_API_KEY` or `QUI_PROXY_URL`. |
+| `QBITTORRENT_API_KEY` | Not set | qBittorrent 5.2+ Web API key (`qbt_...`), used in place of the username and password. |
+| `QUI_PROXY_URL` | Not set | qui's client proxy URL, `http://<qui>:7476/proxy/<key>`. When set, the manager goes through qui instead of `QBITTORRENT_URL`, and needs no qBittorrent credentials. |
 | `DYNAMIC_UPLOAD_ENABLED` | `false` | Set to `true` to calculate the alternative upload limit automatically. When false, the manager only toggles alternative mode. |
 | `MAX_UPLOAD_MIB` | `12` | Maximum upload budget in MiB/s while dynamic control is active. |
 | `MIN_UPLOAD_MIB` | `1` | Lowest upload limit the manager may apply. |

@@ -13,11 +13,26 @@ from controller import StateManager
 @pytest.fixture
 def api_server():
     data = SimpleNamespace(mode=0, prefs={'alt_up_limit': 1024, 'alt_dl_limit': 2048, 'up_limit': 0},
-                           requests=[], active=True)
+                           requests=[], seen=[], active=True, api_key=None)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
+
+        def route(self):
+            """The request's path past qui's /proxy/<key>, or None once it has been refused."""
+            path = urlsplit(self.path).path
+            data.seen.append((self.command, path, self.headers.get('Authorization')))
+            if path.startswith('/proxy/'):
+                key, _, path = path[len('/proxy/'):].partition('/')
+                if key != 'test-qui-key':
+                    self.send_error(401)
+                    return None
+                return '/' + path
+            if path.startswith('/api/v2/') and data.api_key and self.headers.get('Authorization') != f'Bearer {data.api_key}':
+                self.send_error(403)
+                return None
+            return path
 
         def reply(self, body, content_type='text/plain', headers=None):
             self.send_response(200)
@@ -28,7 +43,9 @@ def api_server():
             self.wfile.write(body.encode())
 
         def do_GET(self):
-            path = urlsplit(self.path).path
+            path = self.route()
+            if path is None:
+                return
             data.requests.append(('GET', path, dict(self.headers)))
             if path.startswith('/api/v2/') and self.headers.get('Connection') == 'close':
                 self.close_connection = True
@@ -53,10 +70,15 @@ def api_server():
 
         def do_POST(self):
             body = parse_qs(self.rfile.read(int(self.headers.get('Content-Length', 0))).decode())
-            path = urlsplit(self.path).path
+            path = self.route()
+            if path is None:
+                return
             data.requests.append(('POST', path, body))
             if path == '/api/v2/auth/login':
                 self.reply('Ok.', headers={'Set-Cookie': 'SID=test-session; Path=/'})
+            elif path == '/api/v2/app/version':
+                # qbittorrent-api checks an API key by posting here.
+                self.reply('v5.2.0')
             elif path == '/api/v2/app/setPreferences':
                 changes = json.loads(body['json'][0])
                 # qBittorrent v4 stores speed limits as whole KiB/s internally.
@@ -116,3 +138,34 @@ def test_real_clients_use_token_and_bytes(api_server, multiplier, expected):
     now[0] = 40
     manager.refresh()
     assert data.mode == 0 and data.prefs['up_limit'] == 0
+
+
+@pytest.mark.parametrize('login', ['api_key', 'qui_proxy'])
+def test_qbittorrent_without_a_password(api_server, login):
+    url, data = api_server
+    if login == 'api_key':
+        data.api_key = 'qbt_test-key'
+        qbt = {'qbt_url': url, 'qbt_api_key': 'qbt_test-key'}
+    else:
+        qbt = {'qbt_url': 'http://qbittorrent.invalid:8080', 'qui_proxy_url': f'{url}/proxy/test-qui-key'}
+    manager = StateManager(Config(plex_url=url, plex_token='test-plex-token', dynamic_upload_enabled=True, **qbt),
+                           clock=lambda: 0)
+    manager.refresh()
+    assert manager.qbt_ok and data.mode == 1 and data.prefs['alt_up_limit'] == 8582144
+    calls = [(method, path, auth) for method, path, auth in data.seen if '/api/v2/' in path]
+    if login == 'api_key':
+        # The key goes on every request in place of a login.
+        assert calls[0][:2] == ('POST', '/api/v2/app/version')
+        assert all(auth == 'Bearer qbt_test-key' for _, _, auth in calls)
+        assert not any(path.endswith('/auth/login') for _, path, _ in calls)
+    else:
+        # qui holds the qBittorrent login; the manager's own is a formality to qui.
+        assert calls[0][:2] == ('POST', '/proxy/test-qui-key/api/v2/auth/login')
+        assert all(path.startswith('/proxy/test-qui-key/api/v2/') and auth is None for _, path, auth in calls)
+
+
+def test_qui_proxy_url_must_carry_a_client_key():
+    for bad in ('http://qui:7476', 'http://qui:7476/proxy/', 'qui:7476/proxy/key'):
+        with pytest.raises(ValueError, match='QUI_PROXY_URL'):
+            Config(qui_proxy_url=bad)
+    assert Config(qui_proxy_url='http://qui:7476/qui/proxy/abc123/').qui_proxy_key == 'abc123'
