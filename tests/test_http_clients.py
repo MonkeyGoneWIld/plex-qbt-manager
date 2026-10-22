@@ -42,6 +42,10 @@ def api_server():
             self.end_headers()
             self.wfile.write(body.encode())
 
+        def do_HEAD(self):
+            if self.route() is not None:
+                self.reply('')
+
         def do_GET(self):
             path = self.route()
             if path is None:
@@ -116,6 +120,8 @@ def test_real_clients_use_token_and_bytes(api_server, multiplier, expected):
     assert data.mode == 1
     assert data.prefs == {'alt_up_limit': expected, 'alt_dl_limit': 2048, 'up_limit': 0}
     assert manager.qbt_ok and manager.last_plex_ok
+    # No HEAD to guess http or https: a stalled qBittorrent times that out before the cap.
+    assert not any(method == 'HEAD' for method, _, _ in data.seen)
     qbt_reads = [headers for method, path, headers in data.requests if method == 'GET' and path.startswith('/api/v2/')]
     assert qbt_reads and all(headers.get('Connection') == 'close' for headers in qbt_reads)
     session_requests = [headers for method, path, headers in data.requests if path == '/status/sessions']
@@ -152,6 +158,7 @@ def test_qbittorrent_without_a_password(api_server, login):
                            clock=lambda: 0)
     manager.refresh()
     assert manager.qbt_ok and data.mode == 1 and data.prefs['alt_up_limit'] == 8582144
+    assert not any(method == 'HEAD' for method, _, _ in data.seen)
     calls = [(method, path, auth) for method, path, auth in data.seen if '/api/v2/' in path]
     if login == 'api_key':
         # The key goes on every request in place of a login.
