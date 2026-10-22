@@ -15,6 +15,8 @@ when streaming stops, qBittorrent returns to its normal speed settings.
 - Keeps current settings through Plex outages of up to two minutes and then
   disables alternative mode if Plex remains unavailable.
 - Supports multiple Plex streams without double counting session handoffs.
+- Connects to qBittorrent with a username and password, a qBittorrent 5.2+ API
+  key, or [qui](https://github.com/autobrr/qui)'s client proxy.
 - Integrates with
   [Plex Discord Theater](https://github.com/MonkeyGoneWIld/plex-discord-theater)
   for viewer-aware bandwidth estimates, including several Theater instances at once
@@ -31,7 +33,7 @@ Create a `compose.yml` file:
 ```yaml
 services:
   plex-qbt-manager:
-    image: ghcr.io/monkeygonewild/plex-qbt-manager:1.2.0
+    image: ghcr.io/monkeygonewild/plex-qbt-manager:1.2.5
     container_name: plex-qbt-manager
     restart: unless-stopped
     ports:
@@ -300,7 +302,7 @@ Useful endpoints:
 
 Released images are available from the
 [GitHub Container Registry package](https://github.com/MonkeyGoneWIld/plex-qbt-manager/pkgs/container/plex-qbt-manager)
-as `latest`, `1.2.0`, and `1.2`.
+as `latest`, `1.2.5`, and `1.2`.
 
 ## License
 
