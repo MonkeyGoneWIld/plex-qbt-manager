@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from urllib.parse import urlsplit
-from theater import Theater, overlay_all
+from theater import Theater, overlay_all, shared_terms
 
 from plexapi.server import PlexServer
 from qbittorrentapi import Client as QBittorrentClient, Forbidden403Error, LoginFailed, Unauthorized401Error
@@ -51,6 +51,20 @@ def validate_config(cfg):
         if value <= 0:
             raise ValueError(f'{name.upper()} must be greater than zero')
         setattr(cfg, name, value)
+    # A shared stream's weighting (theater.py, viewer_weight): BASE × (1 + FACTOR × (viewers − 1))
+    # once either is set, the other taking its default; with neither, as before. Unset stays
+    # None, so validating again reads the same.
+    for name, allows_zero in (('theater_shared_base', False), ('theater_extra_viewer_factor', True),
+                              ('theater_max_weight', False)):
+        raw = getattr(cfg, name)
+        if raw is None or not str(raw).strip():
+            setattr(cfg, name, None)
+            continue
+        value = decimal_value(str(raw).strip(), name.upper())
+        if value < 0 or (value == 0 and not allows_zero):
+            raise ValueError(f'{name.upper()} must be {"zero or more" if allows_zero else "greater than zero"}')
+        setattr(cfg, name, value)
+    cfg.theater_shared_weighting = cfg.theater_shared_base is not None or cfg.theater_extra_viewer_factor is not None
     if any(name == '1' for name, _, _ in cfg.theater_extra):
         raise ValueError('Set the first Theater with THEATER_URL; numbered instances start at THEATER_URL_2')
     cfg.theaters, endpoints = [], set()
@@ -783,6 +797,11 @@ class StateManager:
                 'reserved_bandwidth_mbps': float(sum(s.bandwidth_kbps or 0 for s in self.sessions.values()) / 1000),
                 'theater': {'enabled': True, 'uncertain': any(theater.uncertain for theater in self.theaters),
                             'bandwidth_factor': float(self.cfg.theater_bandwidth_factor),
+                            'weighting': 'shared' if self.cfg.theater_shared_weighting else 'per_viewer',
+                            'shared_base': float(shared_terms(self.cfg)[0]),
+                            'extra_viewer_factor': float(shared_terms(self.cfg)[1]),
+                            'max_weight': float(self.cfg.theater_max_weight)
+                            if self.cfg.theater_max_weight is not None else None,
                             'instances': [theater.status() for theater in self.theaters]}
                            if self.theaters else {'enabled': False},
                 'unknown_bandwidth_sessions': sum(s.bandwidth_kbps is None for s in self.sessions.values()),

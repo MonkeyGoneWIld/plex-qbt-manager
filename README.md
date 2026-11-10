@@ -174,14 +174,29 @@ variables to the manager service:
     environment:
       THEATER_URL: "http://plex-discord-theater:3000"
       THEATER_API_KEY: "replace-with-a-shared-random-secret"
-      THEATER_BANDWIDTH_FACTOR: "0.85"
+      THEATER_EXTRA_VIEWER_FACTOR: "0.1"
       THEATER_POLL_INTERVAL_SECONDS: "5"
       THEATER_TIMEOUT_SECONDS: "3"
       THEATER_STALE_SECONDS: "30"
 ```
 
 The services must be able to reach each other. For one viewer, the Plex bandwidth
-is counted once. For two or more viewers, the estimate is:
+is counted once. Two or more viewers of one stream fetch the same segments
+through Discord's proxy, whose cache sends most of them to the second and later
+viewers, and the players share segments with each other as well, so a shared
+stream costs far less than one feed per viewer. With `THEATER_SHARED_BASE` or
+`THEATER_EXTRA_VIEWER_FACTOR` set, the estimate for two or more viewers is:
+
+```text
+Plex bandwidth × THEATER_SHARED_BASE × (1 + THEATER_EXTRA_VIEWER_FACTOR × (viewer count − 1))
+```
+
+It is at most `Plex bandwidth × THEATER_MAX_WEIGHT` when that is set. With a base
+of 1 and a factor of 0.1, three viewers of an 8 Mbps stream reserve 9.6 Mbps.
+Each stream is counted on its own: viewers on different audio or subtitle tracks
+of one film can be on different streams, and each of those is a feed of its own.
+
+With neither set, the estimate is the original one:
 
 ```text
 Plex bandwidth × viewer count × THEATER_BANDWIDTH_FACTOR
@@ -194,7 +209,10 @@ streams are added together.
 |---|---:|---|
 | `THEATER_URL` | Empty | Theater URL reachable from the manager. Empty disables the integration. |
 | `THEATER_API_KEY` | Empty | Shared secret matching Theater's `QBT_MANAGER_API_KEY`. |
-| `THEATER_BANDWIDTH_FACTOR` | `1` | Per-viewer estimate used when a variant has at least two viewers. |
+| `THEATER_SHARED_BASE` | Empty | A stream with at least two viewers, in feeds of one viewer, before extra viewers are added. Setting this or `THEATER_EXTRA_VIEWER_FACTOR` turns on the shared estimate; unset, it is `1` there. |
+| `THEATER_EXTRA_VIEWER_FACTOR` | Empty | What each viewer after the first adds to a shared stream, as a share of the base: `0.1` is 10% more per viewer. Setting this or `THEATER_SHARED_BASE` turns on the shared estimate; unset, it is `0.1` there. `0` keeps a shared stream at the base. |
+| `THEATER_MAX_WEIGHT` | Empty | Most a shared stream can reserve, in feeds of one viewer, with the shared estimate. Empty is no limit. |
+| `THEATER_BANDWIDTH_FACTOR` | `1` | Per-viewer estimate used when a variant has at least two viewers, while neither `THEATER_SHARED_BASE` nor `THEATER_EXTRA_VIEWER_FACTOR` is set. |
 | `THEATER_POLL_INTERVAL_SECONDS` | `5` | Minimum seconds between Theater API checks. A Plex playback webhook brings the next check forward, at most once a second. Use `1`, with `POLLING_INTERVAL` at `1`, to see a new Theater stream within about a second. |
 | `THEATER_TIMEOUT_SECONDS` | `3` | Timeout for a Theater API request. |
 | `THEATER_STALE_SECONDS` | `30` | Seconds an unreachable Theater's last data keeps counting. After that, the instance is ignored until it answers again. |
@@ -206,13 +224,10 @@ With Theater's `PLAYBACK_ENGINE=ffmpeg`, Theater makes streams from the file
 itself, so Plex has no bandwidth for them. Theater reports what one viewer of
 each such stream downloads instead, one figure for the whole stream as Plex
 gives one for its own: a copy's file average, a re-encode's target bitrate.
-The manager uses that figure in place of Plex's:
+The manager uses that figure in place of Plex's, weighted by the stream's
+viewers in the same way.
 
-```text
-Theater bandwidth × viewer count × THEATER_BANDWIDTH_FACTOR
-```
-
-The single-viewer, relay, pause and stop rules are the same as for Plex
+The single-viewer, shared-stream, pause and stop rules are the same as for Plex
 streams. Theater also shows these streams in Plex's Now Playing
 (`FFMPEG_REPORT_TO_PLEX`). The manager recognizes that Plex session by its
 player and does not count it a second time, including the seconds Plex keeps
@@ -236,7 +251,10 @@ viewer weighting, and its `bandwidth_source` is `theater_snapshot` for an ffmpeg
 stream or `plex_session` for a Plex one. Its `theater` details add `engine`,
 `bandwidth_kbps` (one viewer's), `bandwidth_source` (`measured` or `target`) and
 `plex_client_id` (the Plex player Theater reports the stream as). These are
-empty for streams played through Plex. When a room's next title plays through
+empty for streams played through Plex. The `theater` object at the top of
+`GET /status` shows the weighting in force: `weighting` (`shared` or
+`per_viewer`), `shared_base`, `extra_viewer_factor`, `max_weight` and
+`bandwidth_factor`. When a room's next title plays through
 Plex after an ffmpeg one, its session keeps the ffmpeg stream's figure, and
 `theater_snapshot`, until Plex lists a bandwidth for the new stream.
 
@@ -255,8 +273,9 @@ number:
 ```
 
 Continue with `THEATER_URL_3` and `THEATER_API_KEY_3` for a third instance.
-`THEATER_BANDWIDTH_FACTOR` and the poll, timeout and stale settings apply to
-every instance.
+The weighting settings (`THEATER_SHARED_BASE`, `THEATER_EXTRA_VIEWER_FACTOR`,
+`THEATER_MAX_WEIGHT` and `THEATER_BANDWIDTH_FACTOR`) and the poll, timeout and
+stale settings apply to every instance.
 
 Every instance must use the same Plex server as `PLEX_URL`. If an instance
 reports a different Plex server, its streams count as nothing until that is

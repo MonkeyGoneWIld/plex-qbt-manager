@@ -64,11 +64,45 @@ def add_theater(rig, monkeypatch, name, *streams, **kwargs):
 
 @pytest.mark.parametrize('count,expected', [(0, '0'), (1, '1'), (2, '1.6'), (3, '2.4')])
 def test_factor_only_for_shared_variant(count, expected):
-    assert viewer_weight(count, Decimal('0.8')) == Decimal(expected)
+    assert viewer_weight(count, app.Config(theater_bandwidth_factor='0.8')) == Decimal(expected)
 
 
-def test_relay_counts_one_feed_without_p2p_discount():
-    assert viewer_weight(7, Decimal('.8'), 'vps_relay') == 1
+@pytest.mark.parametrize('settings,expected', [
+    (dict(theater_extra_viewer_factor='0.1'), ['0', '1', '1.1', '1.2', '1.4']),
+    (dict(theater_shared_base='1.2'), ['0', '1', '1.32', '1.44', '1.68']),
+    (dict(theater_shared_base='1', theater_extra_viewer_factor='0'), ['0', '1', '1', '1', '1']),
+    (dict(theater_extra_viewer_factor='0.5', theater_max_weight='2'), ['0', '1', '1.5', '2', '2']),
+    # THEATER_BANDWIDTH_FACTOR is the per-viewer weighting's; the shared one ignores it.
+    (dict(theater_bandwidth_factor='0.8', theater_extra_viewer_factor='0.1'), ['0', '1', '1.1', '1.2', '1.4']),
+])
+def test_shared_stream_is_base_plus_a_share_per_extra_viewer(settings, expected):
+    cfg = app.Config(**settings)
+    assert cfg.theater_shared_weighting
+    assert [viewer_weight(n, cfg) for n in (0, 1, 2, 3, 5)] == [Decimal(e) for e in expected]
+
+
+def test_shared_weighting_read_from_environment(monkeypatch):
+    for name in ('THEATER_SHARED_BASE', 'THEATER_EXTRA_VIEWER_FACTOR', 'THEATER_MAX_WEIGHT'):
+        monkeypatch.setenv(name, '')
+    monkeypatch.setenv('THEATER_BANDWIDTH_FACTOR', '0.85')
+    unset = app.Config()
+    assert not unset.theater_shared_weighting and viewer_weight(3, unset) == Decimal('2.55')
+    monkeypatch.setenv('THEATER_SHARED_BASE', '1.1')
+    monkeypatch.setenv('THEATER_EXTRA_VIEWER_FACTOR', '0.2')
+    monkeypatch.setenv('THEATER_MAX_WEIGHT', '1.5')
+    shared = app.Config()
+    assert [viewer_weight(n, shared) for n in (1, 2, 3)] == [1, Decimal('1.32'), Decimal('1.5')]
+
+
+@pytest.mark.parametrize('mode', ['direct_p2p', 'vps_relay', None])
+def test_delivery_mode_accepted_and_not_read(mode):
+    # Older Theaters send it, a relay one 'vps_relay'; newer ones only for older managers.
+    s = snapshot(stream(viewers=3))
+    if mode is None:
+        del s['delivery_mode']
+    else:
+        s['delivery_mode'] = mode
+    assert validate_snapshot(s)['streams'][0]['viewer_count'] == 3
 
 
 def test_three_track_variants_and_ordinary_same_account(rig, monkeypatch):
@@ -454,7 +488,9 @@ def test_custom_plex_stale_timeout_overrides_relaxation_debounce(rig):
 
 
 @pytest.mark.parametrize('kwargs', [dict(theater_url='http://x'), dict(theater_url='ftp://x', theater_api_key='secret'),
-    dict(theater_bandwidth_factor=0), dict(theater_bandwidth_factor='NaN'), dict(theater_stale_seconds=0)])
+    dict(theater_bandwidth_factor=0), dict(theater_bandwidth_factor='NaN'), dict(theater_stale_seconds=0),
+    dict(theater_shared_base=0), dict(theater_shared_base='x'), dict(theater_extra_viewer_factor='-0.1'),
+    dict(theater_extra_viewer_factor='Infinity'), dict(theater_max_weight=0), dict(theater_max_weight='NaN')])
 def test_theater_config_validation(kwargs):
     with pytest.raises(ValueError):
         Config(**kwargs)
@@ -490,10 +526,14 @@ def test_plex_engine_stream_without_new_keys_is_matched_as_before(rig, monkeypat
     assert [session['theater'][k] for k in ('engine', 'bandwidth_kbps', 'bandwidth_source', 'plex_client_id')] == [None] * 4
 
 
-@pytest.mark.parametrize('viewers,mode,kbps', [(1, 'direct_p2p', 8000), (3, 'direct_p2p', 19200), (3, 'vps_relay', 8000)])
+@pytest.mark.parametrize('viewers,mode,kbps', [(1, 'direct_p2p', 8000), (3, 'direct_p2p', 19200),
+                                               (3, 'vps_relay', 19200), (3, None, 19200)])
 def test_ffmpeg_stream_without_plex_row_reserves_theater_bandwidth(rig, monkeypatch, viewers, mode, kbps):
     t = enable(rig, monkeypatch, ffmpeg(viewers=viewers))
-    t.snapshot['delivery_mode'] = mode
+    if mode is None:
+        del t.snapshot['delivery_mode']
+    else:
+        t.snapshot['delivery_mode'] = mode
     rig.poll(0)
     assert set(rig.m.sessions) == {'theater:hls-1'} and not t.uncertain
     assert rig.m.status()['reserved_bandwidth_mbps'] == kbps / 1000
@@ -847,3 +887,18 @@ def test_plex_stream_bridged_from_an_ffmpeg_one_says_whose_figure_it_reserves(ri
     assert session['bandwidth_kbps'] == 11200 and session['bandwidth_source'] == 'plex_session'
     assert session['theater']['plex_bandwidth_kbps'] == 7000 and not t.uncertain
     assert set(rig.m.sessions) == {'theater:next'} and 'identity changed' not in caplog.text
+
+
+def test_shared_weighting_reserves_base_plus_extra_viewers(rig, monkeypatch):
+    t = enable(rig, monkeypatch, ffmpeg('a', viewers=3), ffmpeg('b', viewers=1))
+    rig.m.cfg.theater_shared_weighting = True
+    rig.m.cfg.theater_shared_base = Decimal('1')
+    rig.m.cfg.theater_extra_viewer_factor = Decimal('0.1')
+    rig.poll(0)
+    status = rig.m.status()
+    # 8000 × 1.2 for the three on 'a', 8000 for the one on 'b'; the room's two streams are two feeds.
+    assert status['reserved_bandwidth_mbps'] == 17.6 and not t.uncertain
+    assert status['sessions']['theater:a']['theater']['weight'] == 1.2
+    assert status['sessions']['theater:b']['theater']['weight'] == 1
+    assert 'delivery_mode' not in status['sessions']['theater:a']['theater']
+    assert status['theater']['weighting'] == 'shared' and status['theater']['extra_viewer_factor'] == 0.1

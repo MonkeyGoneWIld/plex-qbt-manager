@@ -15,6 +15,7 @@ from urllib.parse import quote, quote_plus
 
 from flask import Flask, jsonify, request
 from controller import StateManager, validate_config
+from theater import weighting_text
 from waitress import serve
 
 
@@ -67,6 +68,12 @@ class Config:
     # poll, timeout and stale settings below are shared by every instance.
     theater_extra: list = field(default_factory=lambda: numbered_theaters(os.environ))
     theater_bandwidth_factor: Decimal = field(default_factory=lambda: os.getenv('THEATER_BANDWIDTH_FACTOR', '1'))
+    # A stream two or more watch: THEATER_SHARED_BASE × (1 + THEATER_EXTRA_VIEWER_FACTOR ×
+    # (viewers − 1)), at most THEATER_MAX_WEIGHT, once either of the first two is set (theater.py,
+    # viewer_weight). With neither, viewers × THEATER_BANDWIDTH_FACTOR. Empty is unset.
+    theater_shared_base: Decimal | None = field(default_factory=lambda: os.getenv('THEATER_SHARED_BASE', ''))
+    theater_extra_viewer_factor: Decimal | None = field(default_factory=lambda: os.getenv('THEATER_EXTRA_VIEWER_FACTOR', ''))
+    theater_max_weight: Decimal | None = field(default_factory=lambda: os.getenv('THEATER_MAX_WEIGHT', ''))
     theater_poll_interval_seconds: int = field(default_factory=lambda: os.getenv('THEATER_POLL_INTERVAL_SECONDS', '5'))
     theater_timeout_seconds: int = field(default_factory=lambda: os.getenv('THEATER_TIMEOUT_SECONDS', '3'))
     theater_stale_seconds: int = field(default_factory=lambda: os.getenv('THEATER_STALE_SECONDS', '30'))
@@ -237,9 +244,9 @@ def main():
                 config.stop_delay_seconds, config.debounce_seconds, config.drift_check_seconds,
                 config.plex_stale_seconds, config.plex_timeout, config.qbt_timeout)
     state = StateManager(config)
-    logger.info('Theater integration enabled=%s instances=%s factor=%s poll=%ss timeout=%ss stale=%ss; '
+    logger.info('Theater integration enabled=%s instances=%s weighting=%s poll=%ss timeout=%ss stale=%ss; '
                 'single-viewer factor=1', bool(config.theaters), [theater['name'] for theater in config.theaters],
-                config.theater_bandwidth_factor,
+                weighting_text(config),
                 config.theater_poll_interval_seconds, config.theater_timeout_seconds, config.theater_stale_seconds)
 
     def handle_signal(signum, _frame):

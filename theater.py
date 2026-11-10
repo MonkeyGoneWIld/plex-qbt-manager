@@ -18,12 +18,44 @@ def newest_observation(observations):
     return max(numeric)[1] if len(numeric) == len(observations) else observations[-1]
 
 
-def viewer_weight(count, factor, delivery_mode='direct_p2p'):
+def viewer_weight(count, cfg):
+    """What a stream (one variant) with `count` viewers reserves, in feeds of one viewer.
+
+    One viewer is one feed. Every viewer of a stream fetches the same segments through
+    Discord's proxy, whose cache sends most of them to the second and later viewers, and the
+    players share them with each other besides, so a shared stream costs far less than a feed
+    per viewer. With THEATER_SHARED_BASE or THEATER_EXTRA_VIEWER_FACTOR set, a shared stream is
+    BASE × (1 + FACTOR × (viewers − 1)), at most THEATER_MAX_WEIGHT; with neither, it is
+    viewers × THEATER_BANDWIDTH_FACTOR, as before.
+    """
     if count == 0:
         return Decimal(0)
-    if delivery_mode == 'vps_relay':
+    if count == 1:
         return Decimal(1)
-    return Decimal(count) * (factor if count >= 2 else Decimal(1))
+    if not cfg.theater_shared_weighting:
+        return Decimal(count) * cfg.theater_bandwidth_factor
+    base, factor = shared_terms(cfg)
+    weight = base * (1 + factor * (count - 1))
+    return weight if cfg.theater_max_weight is None else min(weight, cfg.theater_max_weight)
+
+
+SHARED_BASE_DEFAULT = Decimal(1)
+EXTRA_VIEWER_FACTOR_DEFAULT = Decimal('0.1')
+
+
+def shared_terms(cfg):
+    """THEATER_SHARED_BASE and THEATER_EXTRA_VIEWER_FACTOR, either one's default where unset."""
+    return (SHARED_BASE_DEFAULT if cfg.theater_shared_base is None else cfg.theater_shared_base,
+            EXTRA_VIEWER_FACTOR_DEFAULT if cfg.theater_extra_viewer_factor is None else cfg.theater_extra_viewer_factor)
+
+
+def weighting_text(cfg):
+    """The weighting in force, for the log."""
+    if not cfg.theater_shared_weighting:
+        return f'per-viewer factor={cfg.theater_bandwidth_factor}'
+    base, factor = shared_terms(cfg)
+    return (f'shared base={base} extra_viewer_factor={factor} '
+            f'max={cfg.theater_max_weight if cfg.theater_max_weight is not None else "none"}')
 
 
 def validate_snapshot(value):
@@ -34,8 +66,8 @@ def validate_snapshot(value):
             raise ValueError(f'Invalid Theater {key}')
     if type(value.get('sequence')) is not int or value['sequence'] < 0:
         raise ValueError('Invalid Theater sequence')
-    if value.get('delivery_mode') not in ('direct_p2p', 'vps_relay'):
-        raise ValueError('Invalid Theater delivery mode')
+    # delivery_mode, which Theater still sends for managers that require it, is no longer read:
+    # Theater's VPS relay is gone, and a stream is weighted by its viewers alone.
     streams = value.get('streams')
     if not isinstance(streams, list) or len(streams) > 4096:
         raise ValueError('Invalid Theater streams')
@@ -306,7 +338,7 @@ class Theater:
                 continue
             state = stream['state'] if stream['viewer_count'] else 'stopped'
             revision = (self.snapshot['instance_id'], stream['state_revision'])
-            weight = viewer_weight(stream['viewer_count'], self.cfg.theater_bandwidth_factor, self.snapshot['delivery_mode'])
+            weight = viewer_weight(stream['viewer_count'], self.cfg)
             bandwidth = Decimal(base.bandwidth_kbps) * weight if base.bandwidth_kbps is not None else None
             if state != 'playing' and old:
                 bandwidth = old['observation'].bandwidth_kbps
@@ -326,15 +358,14 @@ class Theater:
                                            'plex_user': base.user, 'plex_user_id': base.user_id,
                                            'plex_bandwidth_kbps': plex_kbps,
                                            'engine': stream.get('engine'), 'bandwidth_kbps': stream.get('bandwidth_kbps'),
-                                           'bandwidth_source': stream.get('bandwidth_source'), 'plex_client_id': client,
-                                           'delivery_mode': self.snapshot['delivery_mode']})
+                                           'bandwidth_source': stream.get('bandwidth_source'), 'plex_client_id': client})
             self.owned[sid] = {'base': base, 'observation': obs, 'zero_since': since if not stream['viewer_count'] else None,
                                'plex_client_id': client}
             result[obs.key] = obs
-            logger.debug('Theater theater=%s session=%s user=%r user_id=%r variant=%s viewers=%s factor=%s weight=%s '
+            logger.debug('Theater theater=%s session=%s user=%r user_id=%r variant=%s viewers=%s weighting=%s weight=%s '
                          'base_kbps=%s effective_kbps=%s state=%s revision=%s matched=%s engine=%s bandwidth_source=%s '
                          'plex_client_id=%r', self.name, sid, base.user, base.user_id, stream['variant_id'],
-                         stream['viewer_count'], self.cfg.theater_bandwidth_factor, weight, base.bandwidth_kbps,
+                         stream['viewer_count'], weighting_text(self.cfg), weight, base.bandwidth_kbps,
                          bandwidth, state, revision, bool(exact or reported), stream.get('engine'),
                          base.bandwidth_source if measured is None else stream.get('bandwidth_source'), client)
         # Retain stopped ownership while Plex keeps its transcode alive: never count it
