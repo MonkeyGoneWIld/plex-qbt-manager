@@ -21,6 +21,9 @@ when streaming stops, qBittorrent returns to its normal speed settings.
   [Plex Discord Theater](https://github.com/MonkeyGoneWIld/plex-discord-theater)
   for viewer-aware bandwidth estimates, including several Theater instances at once
   and the bandwidth Theater gives for its ffmpeg engine's streams and its copies.
+  A stream several people watch can be reserved as one feed plus a small share
+  for each extra viewer, since Discord's cache and the players' own sharing
+  deliver most of the rest.
 - Runs as a lightweight Docker container on AMD64 and ARM64.
 
 No Tautulli, Tracearr, browser extension, or additional Plex account is needed.
@@ -33,7 +36,7 @@ Create a `compose.yml` file:
 ```yaml
 services:
   plex-qbt-manager:
-    image: ghcr.io/monkeygonewild/plex-qbt-manager:1.2.5
+    image: ghcr.io/monkeygonewild/plex-qbt-manager:1.3.0
     container_name: plex-qbt-manager
     restart: unless-stopped
     ports:
@@ -321,7 +324,7 @@ Useful endpoints:
 
 Released images are available from the
 [GitHub Container Registry package](https://github.com/MonkeyGoneWIld/plex-qbt-manager/pkgs/container/plex-qbt-manager)
-as `latest`, `1.2.5`, and `1.2`.
+as `latest`, `1.3.0`, and `1.3`.
 
 ## License
 
